@@ -97,7 +97,44 @@ class Agent:
         token: str,
         token_contract_address: str | None = None,
     ) -> PaymentRecord:
-        contract_address = token_contract_address or self._settings.default_token_contract
+        """Every token this agent is configured for is payable by name —
+        not only the one contract address baked into
+        `DEFAULT_TOKEN_CONTRACT` at setup time. `token_contract_address`
+        still overrides both the contract and (implicitly) the network,
+        for a token this agent doesn't have in its own payout_tokens."""
+        chain_id = self._settings.chain_id
+        rpc_url = self._settings.rpc_url
+        contract_address = token_contract_address
+
+        if contract_address is None:
+            limits = self._agents_client.get_agent(self._settings.moramba_agent_id)
+            resolved = limits.resolve_payout_token(token)
+            if resolved is not None and resolved.token_address:
+                contract_address = resolved.token_address
+                if resolved.chain and resolved.rpc_url:
+                    # A payout token can live on a different chain than
+                    # this wallet's static .env network (same reasoning
+                    # as pay_agent's destination-token lookup) — prefer
+                    # the token's own chain/rpc when Moramba reports one.
+                    chain_id = resolved.chain
+                    rpc_url = resolved.rpc_url
+            elif limits.payout_tokens:
+                # The agent DOES have a specific, restricted set of
+                # tokens and this one isn't in it — reject directly
+                # rather than silently falling back to a default
+                # contract that belongs to a different token entirely.
+                accepted = [t.token_name for t in limits.payout_tokens]
+                return self.ledger.record(
+                    rail="erc20", recipient=to_address, token=token, amount=amount,
+                    status=STATUS_REJECTED,
+                    reason=f"token {token!r} is not supported by this agent — accepts: {accepted}",
+                )
+            else:
+                # No restriction configured at all — fall back to the
+                # single legacy default, same as before this method knew
+                # how to resolve tokens by name.
+                contract_address = self._settings.default_token_contract
+
         if not contract_address:
             return self.ledger.record(
                 rail="erc20", recipient=to_address, token=token, amount=amount,
@@ -112,8 +149,8 @@ class Agent:
             )
 
         result = erc20.pay(
-            rpc_url=self._settings.rpc_url,
-            chain_id=self._settings.chain_id,
+            rpc_url=rpc_url,
+            chain_id=chain_id,
             account=self.wallet._account,
             token_contract_address=contract_address,
             to_address=to_address,
@@ -121,7 +158,7 @@ class Agent:
         )
         record = self.ledger.record(
             rail="erc20", recipient=to_address, token=token, amount=amount,
-            chain_id=self._settings.chain_id,
+            chain_id=chain_id,
             status=STATUS_SETTLED if result.success else STATUS_FAILED,
             tx_hash=result.tx_hash, reason=result.error,
             raw_request=result.raw_request, raw_response=result.raw_response,

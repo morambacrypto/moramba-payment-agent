@@ -4,7 +4,7 @@
 x402, AP2 (Autonomous), Moramba Pay Button, and Agent Transfer (pay any
 Moramba agent directly by id) — plus the local ledger, the live limit
 check, a FastAPI service wrapper, the setup wizard, and the MCP tool
-server, all with a passing test suite (105 tests). Packaged as a proper
+server, all with a passing test suite (119 tests). Packaged as a proper
 pip-installable project (`pyproject.toml`) so a partner can
 `pip install -e .` instead of running from source on `PYTHONPATH`; Docker
 packaging was dropped — not needed for this project. The setup wizard now
@@ -34,7 +34,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 105 tests, all passing
+python -m pytest -q          # 119 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -421,6 +421,23 @@ Getting there surfaced three real bugs, none of them hypothetical:
 ### Plain ERC20 transfer
 The fallback rail: no counterparty protocol, just a direct on-chain
 transfer, still gated by the same local limit check.
+
+`token` resolves by name against the agent's own configured payout
+tokens (`GET .../public/agent`'s `payout_config.allowed_tokens`) — every
+token the agent supports is payable this way, each on its own
+chain/RPC, not only the one contract address written to
+`DEFAULT_TOKEN_CONTRACT` at setup time. If the agent has a specific,
+restricted token list and the requested `token` isn't in it, the
+transfer is rejected outright ("not supported by this agent") rather
+than silently falling back to a default contract that belongs to a
+different token — the fallback only applies when the agent has no
+token restriction configured at all. An explicit
+`token_contract_address` still overrides resolution entirely (and then
+uses the wallet's own `.env` chain/RPC, since there's no other network
+to infer it from). Gas is estimated live per-transaction (node's own
+`eth_estimateGas` + 20% margin), not a fixed guess — found live
+(2026-09-30): a token needing ~271k gas was rejected against a
+hardcoded 100k limit.
 
 ### Network
 **Tempo testnet (chain id 42431) first.** Mainnet and other chains are a
