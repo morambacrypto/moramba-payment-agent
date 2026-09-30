@@ -59,6 +59,7 @@ def _record_to_dict(record: PaymentRecord) -> dict[str, Any]:
         "status": record.status,
         "tx_hash": record.tx_hash,
         "reason": record.reason,
+        "receiving_agent_id": record.receiving_agent_id,
     }
 
 
@@ -127,6 +128,19 @@ def pay_via_pay_button(button_id: str, network: str | None = None, amount: str |
     a variable-amount button; a fixed-amount button ignores it."""
     record = _get_agent().pay_via_pay_button(
         button_id=button_id, network=network, amount=_parse_amount(amount) if amount is not None else None
+    )
+    return _record_to_dict(record)
+
+
+@mcp.tool()
+def pay_agent(receiving_agent_id: str, amount: str, token: str | None = None) -> dict:
+    """Pay another Moramba agent directly by its agent_id — a payout
+    agent paying a receiving agent. The destination wallet and token
+    contract come from that agent's own Moramba config, never a caller-
+    supplied address; `token` only needs to be given when that agent
+    accepts more than one."""
+    record = _get_agent().pay_agent(
+        receiving_agent_id=receiving_agent_id, amount=_parse_amount(amount), token=token
     )
     return _record_to_dict(record)
 

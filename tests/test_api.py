@@ -1,10 +1,13 @@
 from decimal import Decimal
+from unittest.mock import patch
 
 import httpx
 import respx
 from fastapi.testclient import TestClient
 
 from agent import api
+from agent import engine as engine_module
+from agent.adapters.base import PaymentResult
 from agent.config import Settings
 from agent.engine import Agent
 from agent.ledger import STATUS_REJECTED, STATUS_SETTLED
@@ -177,6 +180,53 @@ def test_pay_button_endpoint_rejects_by_local_limit(tmp_path):
         body = response.json()
         assert body["status"] == STATUS_REJECTED
         assert "per_transaction_limit" in body["reason"]
+    finally:
+        api.app.dependency_overrides.pop(api.get_agent, None)
+        agent.close()
+
+
+@respx.mock
+def test_pay_agent_endpoint_settles_and_returns_receiving_agent_id(tmp_path):
+    agent = make_agent(tmp_path)
+    receiving_agent_id = "88888888-8888-8888-8888-888888888888"
+    mock_agent_lookup(agent.wallet.address, allowed_tokens=[{"token_name": "pathusd"}])
+    respx.get(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent", params={"agent_id": receiving_agent_id}).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "message": "ok",
+                "data": {
+                    "id": receiving_agent_id, "status": "active", "is_receiving_agent": True,
+                    "receiving_config": {
+                        "receive_wallet_address": "0x6784f65225f7d567cf1535525b0dd720b1450d1b",
+                        "accepted_tokens": [
+                            {
+                                "token_name": "pathusd", "token_address": "0x" + "20" * 20,
+                                "network": "tempo_testnet", "chain": 42431, "rpc_url": "https://tempo-testnet.example",
+                            }
+                        ],
+                    },
+                },
+            },
+        )
+    )
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+
+    api.app.dependency_overrides[api.get_agent] = lambda: agent
+    try:
+        with patch.object(engine_module.erc20, "pay", return_value=PaymentResult(success=True, tx_hash="0xagentapi")):
+            with TestClient(api.app) as client:
+                response = client.post(
+                    "/payment-agent-api/pay/agent",
+                    json={"receiving_agent_id": receiving_agent_id, "amount": "1"},
+                )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == STATUS_SETTLED
+        assert body["tx_hash"] == "0xagentapi"
+        assert body["receiving_agent_id"] == receiving_agent_id
     finally:
         api.app.dependency_overrides.pop(api.get_agent, None)
         agent.close()

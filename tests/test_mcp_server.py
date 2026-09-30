@@ -1,10 +1,13 @@
 import asyncio
 import json
+from unittest.mock import patch
 
 import httpx
 import respx
 
+from agent import engine as engine_module
 from agent import mcp_server
+from agent.adapters.base import PaymentResult
 from agent.config import Settings
 from agent.engine import Agent
 from agent.ledger import STATUS_SETTLED
@@ -18,7 +21,7 @@ _KEY_LIKE_SUBSTRINGS = ("private_key", "privatekey", "secret", "wallet_key")
 # The exact tool set README section 6's Surfaces table promises for the
 # MCP server.
 EXPECTED_TOOLS = {
-    "pay_via_mpp", "transfer_erc20", "pay_via_x402", "pay_via_ap2", "pay_via_pay_button",
+    "pay_via_mpp", "transfer_erc20", "pay_via_x402", "pay_via_ap2", "pay_via_pay_button", "pay_agent",
     "check_spend_limits", "list_payments",
 }
 
@@ -186,6 +189,46 @@ def test_pay_via_pay_button_tool_rejects_by_local_limit(tmp_path):
             result = _call("pay_via_pay_button", {"button_id": button_id})
         assert result["status"] == "rejected"
         assert "per_transaction_limit" in result["reason"]
+    finally:
+        mcp_server._agent = None
+        agent.close()
+
+
+def test_pay_agent_tool_settles(tmp_path):
+    agent = make_agent(tmp_path)
+    receiving_agent_id = "77777777-7777-7777-7777-777777777777"
+    mcp_server._agent = agent
+    try:
+        with respx.mock:
+            mock_agent_lookup(agent.wallet.address, allowed_tokens=[{"token_name": "pathusd"}])
+            respx.get(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent", params={"agent_id": receiving_agent_id}).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "success": True, "message": "ok",
+                        "data": {
+                            "id": receiving_agent_id, "status": "active", "is_receiving_agent": True,
+                            "receiving_config": {
+                                "receive_wallet_address": "0x6784f65225f7d567cf1535525b0dd720b1450d1b",
+                                "accepted_tokens": [
+                                    {
+                                        "token_name": "pathusd", "token_address": "0x" + "20" * 20,
+                                        "network": "tempo_testnet", "chain": 42431, "rpc_url": "https://tempo-testnet.example",
+                                    }
+                                ],
+                            },
+                        },
+                    },
+                )
+            )
+            respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+                return_value=httpx.Response(404)
+            )
+            with patch.object(engine_module.erc20, "pay", return_value=PaymentResult(success=True, tx_hash="0xagentmcp")):
+                result = _call("pay_agent", {"receiving_agent_id": receiving_agent_id, "amount": "1"})
+        assert result["status"] == STATUS_SETTLED
+        assert result["tx_hash"] == "0xagentmcp"
+        assert result["receiving_agent_id"] == receiving_agent_id
     finally:
         mcp_server._agent = None
         agent.close()

@@ -70,6 +70,7 @@ def _record_to_dict(record: PaymentRecord) -> dict:
         "tx_hash": record.tx_hash,
         "signature": record.signature,
         "reason": record.reason,
+        "receiving_agent_id": record.receiving_agent_id,
         "synced_at": record.synced_at,
         "sync_attempts": record.sync_attempts,
     }
@@ -118,6 +119,12 @@ class PayButtonRequest(BaseModel):
     button_id: str
     network: str | None = None
     amount: str | None = None
+
+
+class PayAgentRequest(BaseModel):
+    receiving_agent_id: str
+    amount: str
+    token: str | None = None
 
 
 @router.get("/health")
@@ -177,6 +184,16 @@ def pay_button_route(req: PayButtonRequest, agent: Agent = Depends(get_agent)):
         button_id=req.button_id,
         network=req.network,
         amount=_parse_amount(req.amount) if req.amount is not None else None,
+    )
+    return _record_to_dict(record)
+
+
+@router.post("/pay/agent")
+def pay_agent_route(req: PayAgentRequest, agent: Agent = Depends(get_agent)):
+    record = agent.pay_agent(
+        receiving_agent_id=req.receiving_agent_id,
+        amount=_parse_amount(req.amount),
+        token=req.token,
     )
     return _record_to_dict(record)
 
