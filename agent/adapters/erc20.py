@@ -28,6 +28,13 @@ _ERC20_ABI = [
 ]
 
 
+# Only used if the node's own gas estimate can't be obtained — some
+# tokens (proxies, fee/hook logic on transfer) cost well over a plain
+# ERC20's ~50-65k, so a fixed guess here is a last resort, not the norm.
+_FALLBACK_GAS_LIMIT = 150_000
+_GAS_ESTIMATE_MARGIN = 1.2
+
+
 def pay(
     *,
     rpc_url: str,
@@ -36,7 +43,7 @@ def pay(
     token_contract_address: str,
     to_address: str,
     amount: Decimal,
-    gas_limit: int = 100_000,
+    gas_limit: int | None = None,
 ) -> PaymentResult:
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     contract = w3.eth.contract(address=Web3.to_checksum_address(token_contract_address), abi=_ERC20_ABI)
@@ -47,10 +54,21 @@ def pay(
         return PaymentResult(success=False, error=f"could not read token decimals: {exc}")
 
     amount_units = int(amount * (10**decimals))
+    to_checksum = Web3.to_checksum_address(to_address)
 
     try:
         nonce = w3.eth.get_transaction_count(account.address)
-        tx = contract.functions.transfer(Web3.to_checksum_address(to_address), amount_units).build_transaction(
+        transfer_call = contract.functions.transfer(to_checksum, amount_units)
+        if gas_limit is None:
+            # A fixed default breaks on any token whose transfer costs
+            # more than the guess (this is exactly what happened live: a
+            # transfer needing ~271k reverted against a 100k limit) — ask
+            # the node what this specific call actually costs instead.
+            try:
+                gas_limit = int(transfer_call.estimate_gas({"from": account.address}) * _GAS_ESTIMATE_MARGIN)
+            except Exception:  # noqa: BLE001 - estimation itself can fail independently of the real transfer
+                gas_limit = _FALLBACK_GAS_LIMIT
+        tx = transfer_call.build_transaction(
             {
                 "chainId": chain_id,
                 "from": account.address,

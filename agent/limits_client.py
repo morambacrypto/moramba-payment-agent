@@ -93,6 +93,15 @@ class AgentLimits:
     def is_active(self) -> bool:
         return self.status.lower() == "active"
 
+    def resolve_payout_token(self, token_name: str) -> AcceptedToken | None:
+        """Same lookup `ReceivingAgentInfo.resolve_token` does for the
+        receiving side — lets `transfer_erc20` support whichever token
+        the agent is actually configured for, by name, instead of only
+        the one contract address baked into `DEFAULT_TOKEN_CONTRACT`."""
+        return next(
+            (t for t in self.payout_tokens if t.token_name.lower() == token_name.lower()), None
+        )
+
 
 class MorambaAgentClient:
     def __init__(self, base_url: str, timeout: float = 10.0):
