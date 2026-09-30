@@ -4,7 +4,7 @@
 x402, AP2 (Autonomous), Moramba Pay Button, and Agent Transfer (pay any
 Moramba agent directly by id) — plus the local ledger, the live limit
 check, a FastAPI service wrapper, the setup wizard, and the MCP tool
-server, all with a passing test suite (103 tests). Packaged as a proper
+server, all with a passing test suite (105 tests). Packaged as a proper
 pip-installable project (`pyproject.toml`) so a partner can
 `pip install -e .` instead of running from source on `PYTHONPATH`; Docker
 packaging was dropped — not needed for this project. The setup wizard now
@@ -34,7 +34,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 103 tests, all passing
+python -m pytest -q          # 105 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -205,8 +205,8 @@ Three ways to run the same core engine (all share one Python package):
 | Surface | Who uses it | Example |
 |---|---|---|
 | **Library** | a developer embedding payment logic in their own Python app | `from moramba_payment_agent import Agent` |
-| **FastAPI service** | a partner's own backend calling it over HTTP, on their own network | all under `/payment-agent-api`: `POST pay/mpp`, `POST pay/x402`, `POST pay/ap2`, `POST pay/button`, `POST transfer`, `POST limits/check`, `GET payments`, `GET health` |
-| **MCP tool server** | any MCP-compatible AI chat client (Claude Desktop, ChatGPT) | tools: `pay_via_ap2`, `pay_via_x402`, `pay_via_mpp`, `pay_via_pay_button`, `transfer_erc20`, `check_spend_limits`, `list_payments` |
+| **FastAPI service** | a partner's own backend calling it over HTTP, on their own network | all under `/payment-agent-api`: `POST pay/mpp`, `POST pay/x402`, `POST pay/ap2`, `POST pay/button`, `POST pay/agent`, `POST transfer`, `POST limits/check`, `GET payments`, `GET health` |
+| **MCP tool server** | any MCP-compatible AI chat client (Claude Desktop, ChatGPT) | tools: `pay_via_ap2`, `pay_via_x402`, `pay_via_mpp`, `pay_via_pay_button`, `pay_agent`, `transfer_erc20`, `check_spend_limits`, `list_payments` |
 
 ## 4. Supported payment rails
 
