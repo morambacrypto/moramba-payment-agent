@@ -73,6 +73,11 @@ class AgentLimits:
     status: str  # "active" | "inactive" | "suspended"
     allowed_tokens: list[str]
     wallet_addresses: list[str]
+    # Full token objects (chain/rpc_url included), not just names — lets
+    # the setup wizard auto-detect this agent's network instead of asking
+    # for chain_id/rpc_url, the same way get_receiving_agent already does
+    # for the receiving side.
+    payout_tokens: list[AcceptedToken]
     per_transaction_limit: int | None
     daily_transaction_limit: int | None
     monthly_transaction_limit: int | None
@@ -114,6 +119,21 @@ class MorambaAgentClient:
             # used an empty list, which is why this went unnoticed.
             allowed_tokens=[t["token_name"] for t in (payout.get("allowed_tokens") or [])],
             wallet_addresses=[w["public_wallet_address"] for w in wallets],
+            # .get() with fallbacks here, unlike allowed_tokens above — many
+            # existing test fixtures only ever set token_name (the one field
+            # allowed_tokens has always needed), and this must not crash on
+            # those; resolve_chain_and_rpc() already treats an empty/zero
+            # chain+rpc_url as "couldn't auto-detect" and falls back safely.
+            payout_tokens=[
+                AcceptedToken(
+                    token_name=t["token_name"],
+                    token_address=t.get("token_address") or "",
+                    network=t.get("network") or "",
+                    chain=t.get("chain") or 0,
+                    rpc_url=t.get("rpc_url") or "",
+                )
+                for t in (payout.get("allowed_tokens") or [])
+            ],
             per_transaction_limit=payout.get("per_transaction_limit"),
             daily_transaction_limit=payout.get("daily_transaction_limit"),
             monthly_transaction_limit=payout.get("monthly_transaction_limit"),

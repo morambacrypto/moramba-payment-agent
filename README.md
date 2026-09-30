@@ -1,12 +1,18 @@
 # Moramba Payment Agent
 
-**Status: All planned phases implemented, including a fifth rail added
-mid-flight — MPP, ERC20, x402, AP2 (Autonomous) and Moramba Pay Button,
-the local ledger, the live limit check, a FastAPI service wrapper, the
-setup wizard, and the MCP tool server, all with a passing test suite
-(95 tests). Packaged as a proper pip-installable project (`pyproject.toml`)
-so a partner can `pip install -e .` instead of running from source on
-`PYTHONPATH`; Docker packaging was dropped — not needed for this project.
+**Status: All planned phases implemented, now six rails — MPP, ERC20,
+x402, AP2 (Autonomous), Moramba Pay Button, and Agent Transfer (pay any
+Moramba agent directly by id) — plus the local ledger, the live limit
+check, a FastAPI service wrapper, the setup wizard, and the MCP tool
+server, all with a passing test suite (103 tests). Packaged as a proper
+pip-installable project (`pyproject.toml`) so a partner can
+`pip install -e .` instead of running from source on `PYTHONPATH`; Docker
+packaging was dropped — not needed for this project. The setup wizard now
+auto-detects the agent's network (chain/RPC) from its own Moramba config,
+always enables every rail (nothing to choose), and requires every
+remaining answer explicitly — no field is silently defaulted or
+skippable. Running the FastAPI service no longer requires a free port to
+guess at either: `moramba-payment-agent-serve` auto-selects one.
 The Pay Button rail settled a real payment live, end-to-end, on Tempo
 testnet against production (2026-09-29,
 [tx 0x43d1d64f...](https://explore.testnet.tempo.xyz/tx/0x43d1d64fa09f1db9710b780d5382e4d10f5c4762718047285470c57e9aa34194)) —
@@ -28,7 +34,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 95 tests, all passing
+python -m pytest -q          # 103 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -36,6 +42,24 @@ plus the test dependencies, via `pyproject.toml` — the console script
 `moramba-payment-agent-setup` and the plain `python -m agent.setup` both
 still work, whichever you find easier to type. `PYTHONPATH=.` is no
 longer needed once the package is installed.)
+
+The wizard only ever asks for what's actually yours — everything else
+comes from your agent's own Moramba config:
+
+1. **Your Moramba agent id.** The wizard looks it up immediately.
+2. **Your wallet's private key.** It checks the derived address against
+   that agent's registered payout wallets right away — if it doesn't
+   match, it offers to retry with a different key rather than silently
+   writing a config that would reject every payment.
+3. **Your Moramba ACP API key** (for the AP2 rail).
+4. **A local ledger path.**
+
+Network (`CHAIN_ID`/`RPC_URL`) and the ERC20 rail's default token
+contract are auto-detected from the agent's own configured payout token
+— you're only asked for the network manually if Moramba couldn't be
+reached during setup. Every rail is always enabled; there's no "which
+rails do you want" step, and no prompt in the whole wizard accepts a
+blank answer as "use the default" — everything that's asked is required.
 
 As a library:
 
@@ -58,8 +82,16 @@ print(record.status, record.tx_hash)
 As an HTTP service (section 6, "Surfaces"):
 
 ```
-uvicorn agent.api:app --reload
-curl -X POST localhost:8000/payment-agent-api/pay/mpp -H "Content-Type: application/json" -d '{
+moramba-payment-agent-serve   # auto-picks a free port and prints it — no port conflict to debug
+```
+
+(prints something like `Starting moramba-payment-agent on http://127.0.0.1:54321`;
+set `PORT`/`HOST` env vars to pin a specific address instead, or use
+`uvicorn agent.api:app --reload` directly if you want `--reload` for
+local development.)
+
+```
+curl -X POST localhost:PORT/payment-agent-api/pay/mpp -H "Content-Type: application/json" -d '{
   "receiver_base_url": "https://some-receiver.example",
   "receiver_agent_id": "<receiver agent id>",
   "payout_agent_id": "<this agent id>",
@@ -523,13 +555,21 @@ LLM and a private key are in the same room:
    the way: SQLite connections default to single-thread-only, but FastAPI
    runs sync routes in a worker thread pool — `Ledger` now opens with
    `check_same_thread=False`.
-5. **Setup wizard — done.** `python -m agent.setup`: validates the
-   private key and Moramba agent id as you type them (re-prompts rather
-   than accepting garbage), checks — but doesn't block on — whether the
-   wallet is actually registered to that agent in Moramba, writes `.env`
-   at `0600` permissions, and never echoes or logs the key. Interactive
-   flow is injectable (`input_fn`/`getpass_fn`) so it's fully unit-tested
-   without touching real stdin. 10 tests passing.
+5. **Setup wizard — done, then simplified further (2026-09-30).**
+   `python -m agent.setup`: validates the private key and Moramba agent
+   id as you type them (re-prompts rather than accepting garbage), and
+   re-prompts for a different wallet key (with an explicit override) if
+   it isn't registered to that agent in Moramba — rather than just
+   warning and moving on. Network (`CHAIN_ID`/`RPC_URL`) and the ERC20
+   rail's default token contract are auto-detected from the agent's own
+   `payout_config.allowed_tokens` instead of being asked, with a
+   hardcoded known-RPC fallback per chain if that lookup fails or the
+   agent's own token record has no `rpc_url`. Every rail is always
+   enabled — no "which rails" step. Every remaining prompt requires a
+   real answer; nothing is skippable or silently defaulted. Writes `.env`
+   at `0600` permissions, never echoes or logs the key. Interactive flow
+   is injectable (`input_fn`/`getpass_fn`) so it's fully unit-tested
+   without touching real stdin. 13 tests passing.
 6. **MCP tool server — done.** `agent/mcp_server.py`, built on the
    official `mcp` SDK: `pay_via_ap2`, `pay_via_x402`, `pay_via_mpp`,
    `transfer_erc20`, `check_spend_limits`, `list_payments` — the exact
