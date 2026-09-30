@@ -5,7 +5,7 @@ from agent import setup
 from agent.signing import load_wallet
 
 TEST_PRIVATE_KEY = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
-BASE_URL = "https://moramba.example"
+BASE_URL = "https://crypto.moramba.io"
 AGENT_ID = "66666666-6666-6666-6666-666666666666"
 
 
@@ -18,8 +18,17 @@ def make_fake_io(answers: list[str]):
     return fn
 
 
-def mock_agent_lookup(wallet_address: str | None):
+def mock_agent_lookup(wallet_address: str | None, with_payout_token: bool = True):
     wallets = [{"public_wallet_address": wallet_address}] if wallet_address else []
+    payout_config = {"allowed_tokens": [], "wallets": wallets}
+    if with_payout_token:
+        payout_config["allowed_tokens"] = [
+            {
+                "id": "20c6d642-75d1-4fcc-8728-3cb78b6bb0ea", "network": "Tempo", "chain": 42431,
+                "network_type": "testnet", "rpc_url": "https://rpc.moderato.tempo.xyz",
+                "token_name": "pathUSD", "token_address": "0x20c0000000000000000000000000000000000000",
+            }
+        ]
     return respx.get(f"{BASE_URL}/api/v2/morambacrypto/public/agent", params={"agent_id": AGENT_ID}).mock(
         return_value=httpx.Response(
             200,
@@ -27,7 +36,7 @@ def mock_agent_lookup(wallet_address: str | None):
                 "success": True, "message": "ok",
                 "data": {
                     "id": AGENT_ID, "status": "active",
-                    "payout_config": {"allowed_tokens": [], "wallets": wallets},
+                    "payout_config": payout_config,
                     "rate_limit_max_transactions_count": None, "rate_limit_per_period": None,
                 },
             },
@@ -52,57 +61,65 @@ def test_validate_agent_id_accepts_uuid_rejects_garbage():
     assert setup.validate_agent_id("not-a-uuid") is None
 
 
-def test_parse_rails_filters_unknown_and_preserves_canonical_order():
-    assert setup.parse_rails("ap2, mpp, bogus, erc20") == ["mpp", "erc20", "ap2"]
-    assert setup.parse_rails("") == []
-
-
 def test_build_env_content_shape():
     content = setup.build_env_content(
         {
             "wallet_private_key": TEST_PRIVATE_KEY, "moramba_agent_id": AGENT_ID,
-            "moramba_api_base_url": BASE_URL, "chain_id": 42431, "rpc_url": "https://rpc.example",
-            "db_path": "a.db", "default_token_contract": "",
+            "moramba_api_base_url": BASE_URL, "moramba_acp_api_key": "acp-key-123",
+            "chain_id": 42431, "rpc_url": "https://rpc.example",
+            "db_path": "a.db", "default_token_contract": "0x" + "11" * 20,
         }
     )
     assert f"WALLET_PRIVATE_KEY={TEST_PRIVATE_KEY}" in content
     assert f"MORAMBA_AGENT_ID={AGENT_ID}" in content
+    assert "MORAMBA_ACP_API_KEY=acp-key-123" in content
     assert "RPC_URL=https://rpc.example" in content
-    assert "MORAMBA_ACP_API_KEY" not in content  # only present when the ap2 rail was selected
 
 
 @respx.mock
-def test_check_wallet_registered_true_false_and_unreachable():
+def test_fetch_agent_info_returns_limits_on_success_and_none_when_unreachable():
     wallet = load_wallet(TEST_PRIVATE_KEY)
-
     mock_agent_lookup(wallet.address)
-    assert setup.check_wallet_registered(BASE_URL, AGENT_ID, wallet.address) is True
-
-    mock_agent_lookup("0x" + "99" * 20)
-    assert setup.check_wallet_registered(BASE_URL, AGENT_ID, wallet.address) is False
+    assert setup.fetch_agent_info(BASE_URL, AGENT_ID) is not None
 
     respx.get(f"{BASE_URL}/api/v2/morambacrypto/public/agent", params={"agent_id": AGENT_ID}).mock(
         side_effect=httpx.ConnectError("unreachable")
     )
-    assert setup.check_wallet_registered(BASE_URL, AGENT_ID, wallet.address) is None
+    assert setup.fetch_agent_info(BASE_URL, AGENT_ID) is None
 
 
 @respx.mock
-def test_run_wizard_happy_path_writes_env_file(tmp_path):
+def test_resolve_chain_and_rpc_from_agents_own_payout_token():
+    mock_agent_lookup("0xabc", with_payout_token=True)
+    limits = setup.fetch_agent_info(BASE_URL, AGENT_ID)
+    assert setup.resolve_chain_and_rpc(limits) == (42431, "https://rpc.moderato.tempo.xyz")
+
+
+@respx.mock
+def test_resolve_chain_and_rpc_none_when_agent_has_no_payout_tokens():
+    mock_agent_lookup("0xabc", with_payout_token=False)
+    limits = setup.fetch_agent_info(BASE_URL, AGENT_ID)
+    assert setup.resolve_chain_and_rpc(limits) is None
+
+
+def test_resolve_chain_and_rpc_none_when_lookup_failed():
+    assert setup.resolve_chain_and_rpc(None) is None
+
+
+@respx.mock
+def test_run_wizard_happy_path_auto_detects_network(tmp_path):
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    mock_agent_lookup(wallet.address)
+    mock_agent_lookup(wallet.address, with_payout_token=True)
     env_path = tmp_path / ".env"
 
     fn = make_fake_io(
         [
-            TEST_PRIVATE_KEY,       # wallet private key
             AGENT_ID,               # agent id
-            BASE_URL,               # api base url — matches the respx mock above
-            "",                     # chain id -> default
-            "https://rpc.example",  # rpc url
-            "",                     # db path -> default
-            "mpp,erc20",            # rails
-            "",                     # default_token_contract (erc20 selected)
+            TEST_PRIVATE_KEY,       # wallet private key — matches the registered wallet
+            "acp-key-123",          # ACP api key
+            "a.db",                 # db path
+            # no default_token_contract prompt — auto-derived from the
+            # agent's own payout token, same as chain_id/rpc_url
         ]
     )
 
@@ -112,9 +129,39 @@ def test_run_wizard_happy_path_writes_env_file(tmp_path):
     content = env_path.read_text()
     assert f"WALLET_PRIVATE_KEY={TEST_PRIVATE_KEY}" in content
     assert f"MORAMBA_AGENT_ID={AGENT_ID}" in content
-    assert "RPC_URL=https://rpc.example" in content
-    assert "MORAMBA_ACP_API_KEY" not in content  # ap2 rail wasn't selected
+    assert "MORAMBA_ACP_API_KEY=acp-key-123" in content
+    assert "CHAIN_ID=42431" in content
+    assert "RPC_URL=https://rpc.moderato.tempo.xyz" in content
+    assert "DB_PATH=a.db" in content
+    assert "DEFAULT_TOKEN_CONTRACT=0x20c0000000000000000000000000000000000000" in content
     assert oct(env_path.stat().st_mode)[-3:] == "600"
+
+
+@respx.mock
+def test_run_wizard_falls_back_to_manual_network_when_lookup_fails(tmp_path):
+    respx.get(f"{BASE_URL}/api/v2/morambacrypto/public/agent", params={"agent_id": AGENT_ID}).mock(
+        side_effect=httpx.ConnectError("unreachable")
+    )
+    env_path = tmp_path / ".env"
+
+    fn = make_fake_io(
+        [
+            AGENT_ID,
+            TEST_PRIVATE_KEY,
+            "acp-key-123",
+            "42431",                          # chain id, manual
+            "https://rpc.moderato.tempo.xyz",  # rpc url, manual
+            "a.db",
+        ]
+    )
+    setup.run_wizard(input_fn=fn, getpass_fn=fn, env_path=str(env_path))
+
+    assert env_path.exists()
+    content = env_path.read_text()
+    assert "CHAIN_ID=42431" in content
+    assert "RPC_URL=https://rpc.moderato.tempo.xyz" in content
+    # No payout tokens available (lookup failed) — left blank, not asked.
+    assert "DEFAULT_TOKEN_CONTRACT=\n" in content
 
 
 def test_run_wizard_aborts_without_overwriting_when_declined(tmp_path):
@@ -128,32 +175,41 @@ def test_run_wizard_aborts_without_overwriting_when_declined(tmp_path):
 
 
 @respx.mock
-def test_run_wizard_warns_but_still_writes_env_when_wallet_unregistered(tmp_path):
-    mock_agent_lookup("0x" + "99" * 20)  # some other wallet, not ours
+def test_run_wizard_reprompts_for_a_new_key_when_wallet_unregistered(tmp_path):
+    other_wallet = load_wallet("0x" + "22" * 32)
+    mock_agent_lookup(other_wallet.address, with_payout_token=True)  # some other wallet, not ours
     env_path = tmp_path / ".env"
 
     fn = make_fake_io(
         [
-            TEST_PRIVATE_KEY, AGENT_ID, BASE_URL, "", "https://rpc.example", "", "mpp",  # mpp only -> no extra prompts
+            AGENT_ID,
+            TEST_PRIVATE_KEY,   # unregistered — will be asked to retry
+            "y",                # yes, try a different key
+            "0x" + "33" * 32,   # still not registered
+            "n",                # no more retries — proceed anyway
+            "acp-key-123",
+            "a.db",
         ]
     )
     setup.run_wizard(input_fn=fn, getpass_fn=fn, env_path=str(env_path))
 
     assert env_path.exists()
-    assert f"WALLET_PRIVATE_KEY={TEST_PRIVATE_KEY}" in env_path.read_text()
+    assert "WALLET_PRIVATE_KEY=0x" + "33" * 32 in env_path.read_text()
 
 
 def test_run_wizard_reprompts_on_invalid_private_key_then_accepts(tmp_path):
     env_path = tmp_path / ".env"
     fn = make_fake_io(
         [
-            "garbage-key", TEST_PRIVATE_KEY,  # invalid, then valid
-            "not-a-uuid", AGENT_ID,           # invalid, then valid
-            BASE_URL, "", "https://rpc.example", "", "mpp",  # base_url, chain_id, rpc_url, db_path, rails
+            "not-a-uuid", AGENT_ID,             # invalid, then valid
+            "garbage-key", TEST_PRIVATE_KEY,    # invalid, then valid
+            "acp-key-123", "42431", "https://rpc.moderato.tempo.xyz", "a.db",
         ]
     )
     with respx.mock:
-        mock_agent_lookup(load_wallet(TEST_PRIVATE_KEY).address)
+        respx.get(f"{BASE_URL}/api/v2/morambacrypto/public/agent", params={"agent_id": AGENT_ID}).mock(
+            side_effect=httpx.ConnectError("unreachable")
+        )
         setup.run_wizard(input_fn=fn, getpass_fn=fn, env_path=str(env_path))
 
     assert env_path.exists()

@@ -35,6 +35,7 @@ dev = [
 [project.scripts]
 moramba-payment-agent-setup = "agent.setup:main"
 moramba-payment-agent-mcp = "agent.mcp_server:main"
+moramba-payment-agent-serve = "agent.serve:main"
 
 [tool.setuptools]
 packages = ["agent", "agent.adapters"]

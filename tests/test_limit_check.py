@@ -12,6 +12,7 @@ BASE_LIMITS = AgentLimits(
     status="active",
     allowed_tokens=["USDC"],
     wallet_addresses=[WALLET],
+    payout_tokens=[],
     per_transaction_limit=None,
     daily_transaction_limit=None,
     monthly_transaction_limit=None,
