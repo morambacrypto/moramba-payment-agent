@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moramba-payment-agent"
+version = "0.1.0"
+description = "Non-custodial Python payment agent for AI-driven crypto payments (AP2, x402, MPP, ERC20, Moramba Pay Button) — runs on a partner's own machine, never hands the private key to Moramba or the LLM."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+dependencies = [
+    "httpx>=0.27.2",
+    "pydantic>=2.9.2",
+    "pydantic-settings>=2.5.2",
+    "eth-account>=0.13.0",
+    "web3>=7.2.0",
+    "x402[evm,httpx]>=2.20.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.6",
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.2",
+    "respx>=0.21.1",
+]
+
+# Console scripts — same modules the README already documents running via
+# `python -m agent.setup` / `python -m agent.mcp_server`; these just give a
+# partner a shorter command once the package is installed instead of a
+# checked-out source tree on PYTHONPATH.
+[project.scripts]
+moramba-payment-agent-setup = "agent.setup:main"
+moramba-payment-agent-mcp = "agent.mcp_server:main"
+
+[tool.setuptools]
+packages = ["agent", "agent.adapters"]
