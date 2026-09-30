@@ -192,9 +192,11 @@ def run_wizard(input_fn=input, getpass_fn=getpass.getpass, env_path: str = ".env
         while not rpc_url:
             rpc_url = input_fn("RPC URL (required): ").strip()
 
-    db_path = ""
-    while not db_path:
-        db_path = input_fn("Local ledger path (required): ").strip()
+    # Not asked — same default Settings.db_path itself falls back to, so
+    # a fresh setup just gets a ledger file next to wherever it's run
+    # from, with nothing to type.
+    db_path = "moramba_payment_agent.db"
+    print(f"Local ledger: {db_path}\n")
 
     # Same source as the network auto-detection above — the agent's own
     # payout_config.allowed_tokens already carries each token's contract

@@ -62,7 +62,7 @@ def mock_agent_lookup(wallet_address: str, **payout_overrides):
 def test_pay_via_ap2_rejected_by_local_limit_never_signs_a_mandate(tmp_path):
     settings = make_settings(tmp_path)
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    mock_agent_lookup(wallet.address, per_transaction_limit=0)  # any positive amount exceeds this
+    mock_agent_lookup(wallet.address, per_transaction_limit=0, allowed_tokens=[{"token_name": "USD"}])  # any positive amount exceeds this
 
     respx.post(f"{MORAMBA_BASE}/acp/checkout_sessions").mock(
         return_value=httpx.Response(200, json={"id": "sess-1", "currency": "USD", "totals": [{"amount": 500}]})
@@ -86,7 +86,7 @@ def test_pay_via_ap2_rejected_by_local_limit_never_signs_a_mandate(tmp_path):
 def test_pay_via_ap2_settles_end_to_end(tmp_path):
     settings = make_settings(tmp_path)
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    mock_agent_lookup(wallet.address)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "USD"}])
 
     respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
         return_value=httpx.Response(404)

@@ -117,8 +117,8 @@ def test_run_wizard_happy_path_auto_detects_network(tmp_path):
             AGENT_ID,               # agent id
             TEST_PRIVATE_KEY,       # wallet private key — matches the registered wallet
             "acp-key-123",          # ACP api key
-            "a.db",                 # db path
-            # no default_token_contract prompt — auto-derived from the
+            # no db_path prompt — always moramba_payment_agent.db, and no
+            # default_token_contract prompt — auto-derived from the
             # agent's own payout token, same as chain_id/rpc_url
         ]
     )
@@ -132,7 +132,7 @@ def test_run_wizard_happy_path_auto_detects_network(tmp_path):
     assert "MORAMBA_ACP_API_KEY=acp-key-123" in content
     assert "CHAIN_ID=42431" in content
     assert "RPC_URL=https://rpc.moderato.tempo.xyz" in content
-    assert "DB_PATH=a.db" in content
+    assert "DB_PATH=moramba_payment_agent.db" in content
     assert "DEFAULT_TOKEN_CONTRACT=0x20c0000000000000000000000000000000000000" in content
     assert oct(env_path.stat().st_mode)[-3:] == "600"
 
@@ -151,7 +151,6 @@ def test_run_wizard_falls_back_to_manual_network_when_lookup_fails(tmp_path):
             "acp-key-123",
             "42431",                          # chain id, manual
             "https://rpc.moderato.tempo.xyz",  # rpc url, manual
-            "a.db",
         ]
     )
     setup.run_wizard(input_fn=fn, getpass_fn=fn, env_path=str(env_path))
@@ -160,6 +159,7 @@ def test_run_wizard_falls_back_to_manual_network_when_lookup_fails(tmp_path):
     content = env_path.read_text()
     assert "CHAIN_ID=42431" in content
     assert "RPC_URL=https://rpc.moderato.tempo.xyz" in content
+    assert "DB_PATH=moramba_payment_agent.db" in content
     # No payout tokens available (lookup failed) — left blank, not asked.
     assert "DEFAULT_TOKEN_CONTRACT=\n" in content
 
@@ -188,7 +188,6 @@ def test_run_wizard_reprompts_for_a_new_key_when_wallet_unregistered(tmp_path):
             "0x" + "33" * 32,   # still not registered
             "n",                # no more retries — proceed anyway
             "acp-key-123",
-            "a.db",
         ]
     )
     setup.run_wizard(input_fn=fn, getpass_fn=fn, env_path=str(env_path))
@@ -203,7 +202,7 @@ def test_run_wizard_reprompts_on_invalid_private_key_then_accepts(tmp_path):
         [
             "not-a-uuid", AGENT_ID,             # invalid, then valid
             "garbage-key", TEST_PRIVATE_KEY,    # invalid, then valid
-            "acp-key-123", "42431", "https://rpc.moderato.tempo.xyz", "a.db",
+            "acp-key-123", "42431", "https://rpc.moderato.tempo.xyz",
         ]
     )
     with respx.mock:

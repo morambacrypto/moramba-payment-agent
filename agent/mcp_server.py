@@ -95,10 +95,24 @@ def pay_via_mpp(
 
 
 @mcp.tool()
-def transfer_erc20(to_address: str, amount: str, token: str, token_contract_address: str | None = None) -> dict:
-    """Send a plain ERC20 transfer — subject to the same spend-limit check as every other rail."""
+def transfer_erc20(
+    to_address: str,
+    amount: str,
+    token: str,
+    token_contract_address: str | None = None,
+    gas_limit: int | None = None,
+) -> dict:
+    """Send a plain ERC20 transfer — subject to the same spend-limit check as every other rail.
+
+    `gas_limit` is normally left unset (gas is estimated live per call).
+    Only pass it after a failed attempt whose error names the actual gas
+    needed (e.g. "call gas cost (271596) exceeds the gas limit (150000)")
+    AND a human has approved spending that much gas — this raises what a
+    single transfer can cost, so don't set it on your own judgment alone.
+    """
     record = _get_agent().transfer_erc20(
-        to_address=to_address, amount=_parse_amount(amount), token=token, token_contract_address=token_contract_address
+        to_address=to_address, amount=_parse_amount(amount), token=token,
+        token_contract_address=token_contract_address, gas_limit=gas_limit,
     )
     return _record_to_dict(record)
 

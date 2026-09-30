@@ -116,7 +116,7 @@ def test_lifespan_respects_thread_pool_size_env_override(tmp_path, monkeypatch):
 @respx.mock
 def test_pay_mpp_endpoint_settles_and_returns_record(tmp_path):
     agent = make_agent(tmp_path)
-    mock_agent_lookup(agent.wallet.address)
+    mock_agent_lookup(agent.wallet.address, allowed_tokens=[{"token_name": "USDC"}])
     respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
         return_value=httpx.Response(404)
     )
@@ -147,9 +147,9 @@ def test_pay_mpp_endpoint_settles_and_returns_record(tmp_path):
 
 
 @respx.mock
-def test_transfer_endpoint_rejects_without_token_contract_configured(tmp_path):
+def test_transfer_endpoint_rejects_when_agent_has_no_payout_tokens_configured(tmp_path):
     agent = make_agent(tmp_path)
-    mock_agent_lookup(agent.wallet.address)
+    mock_agent_lookup(agent.wallet.address)  # allowed_tokens=[] — nothing is payable
 
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:
@@ -160,7 +160,34 @@ def test_transfer_endpoint_rejects_without_token_contract_configured(tmp_path):
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == STATUS_REJECTED
-        assert "default_token_contract" in body["reason"]
+        assert "not supported" in body["reason"]
+    finally:
+        api.app.dependency_overrides.pop(api.get_agent, None)
+        agent.close()
+
+
+@respx.mock
+def test_transfer_endpoint_forwards_explicit_gas_limit(tmp_path):
+    agent = make_agent(tmp_path)
+    mock_agent_lookup(agent.wallet.address, allowed_tokens=[{"token_name": "USDC"}])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+
+    api.app.dependency_overrides[api.get_agent] = lambda: agent
+    try:
+        with patch.object(engine_module.erc20, "pay", return_value=PaymentResult(success=True, tx_hash="0xhighgas")) as mock_pay:
+            with TestClient(api.app) as client:
+                response = client.post(
+                    "/payment-agent-api/transfer",
+                    json={
+                        "to_address": "0x" + "11" * 20, "amount": "1", "token": "USDC",
+                        "token_contract_address": "0x" + "cc" * 20, "gas_limit": 350_000,
+                    },
+                )
+        assert response.status_code == 200
+        assert response.json()["status"] == STATUS_SETTLED
+        assert mock_pay.call_args.kwargs["gas_limit"] == 350_000
     finally:
         api.app.dependency_overrides.pop(api.get_agent, None)
         agent.close()
@@ -198,7 +225,7 @@ def test_pay_button_endpoint_rejects_by_local_limit(tmp_path):
             ],
         },
     }
-    mock_agent_lookup(agent.wallet.address, per_transaction_limit=0)
+    mock_agent_lookup(agent.wallet.address, per_transaction_limit=0, allowed_tokens=[{"token_name": "pathusd"}])
     respx.get(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/pay-button/{button_id}/methods").mock(
         return_value=httpx.Response(200, json=methods_response)
     )
@@ -266,7 +293,7 @@ def test_pay_agent_endpoint_settles_and_returns_receiving_agent_id(tmp_path):
 @respx.mock
 def test_check_limits_endpoint(tmp_path):
     agent = make_agent(tmp_path)
-    mock_agent_lookup(agent.wallet.address, per_transaction_limit=0)
+    mock_agent_lookup(agent.wallet.address, per_transaction_limit=0, allowed_tokens=[{"token_name": "USDC"}])
 
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:

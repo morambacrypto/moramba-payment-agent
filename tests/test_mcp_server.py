@@ -91,7 +91,7 @@ def _call(name: str, arguments: dict):
 @respx.mock
 def test_check_spend_limits_tool(tmp_path):
     agent = make_agent(tmp_path)
-    mock_agent_lookup(agent.wallet.address, per_transaction_limit=0)
+    mock_agent_lookup(agent.wallet.address, per_transaction_limit=0, allowed_tokens=[{"token_name": "USDC"}])
     mcp_server._agent = agent
     try:
         result = _call("check_spend_limits", {"recipient": "vendor-a", "token": "USDC", "amount": "5", "rail": "mpp"})
@@ -105,7 +105,7 @@ def test_check_spend_limits_tool(tmp_path):
 @respx.mock
 def test_pay_via_mpp_tool_settles(tmp_path):
     agent = make_agent(tmp_path)
-    mock_agent_lookup(agent.wallet.address)
+    mock_agent_lookup(agent.wallet.address, allowed_tokens=[{"token_name": "USDC"}])
     respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
         return_value=httpx.Response(404)
     )
@@ -126,6 +126,30 @@ def test_pay_via_mpp_tool_settles(tmp_path):
         )
         assert result["status"] == STATUS_SETTLED
         assert result["tx_hash"] == "0xmcptx"
+    finally:
+        mcp_server._agent = None
+        agent.close()
+
+
+@respx.mock
+def test_transfer_erc20_tool_forwards_explicit_gas_limit(tmp_path):
+    agent = make_agent(tmp_path)
+    mock_agent_lookup(agent.wallet.address, allowed_tokens=[{"token_name": "USDC"}])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    mcp_server._agent = agent
+    try:
+        with patch.object(engine_module.erc20, "pay", return_value=PaymentResult(success=True, tx_hash="0xhighgas")) as mock_pay:
+            result = _call(
+                "transfer_erc20",
+                {
+                    "to_address": "0x" + "11" * 20, "amount": "1", "token": "USDC",
+                    "token_contract_address": "0x" + "cc" * 20, "gas_limit": 350_000,
+                },
+            )
+        assert result["status"] == STATUS_SETTLED
+        assert mock_pay.call_args.kwargs["gas_limit"] == 350_000
     finally:
         mcp_server._agent = None
         agent.close()
@@ -182,7 +206,7 @@ def test_pay_via_pay_button_tool_rejects_by_local_limit(tmp_path):
     mcp_server._agent = agent
     try:
         with respx.mock:
-            mock_agent_lookup(agent.wallet.address, per_transaction_limit=0)
+            mock_agent_lookup(agent.wallet.address, per_transaction_limit=0, allowed_tokens=[{"token_name": "pathusd"}])
             respx.get(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/pay-button/{button_id}/methods").mock(
                 return_value=httpx.Response(200, json=methods_response)
             )

@@ -77,7 +77,7 @@ def mock_agent_lookup(wallet_address: str, **payout_overrides):
 def test_pay_via_pay_button_rejected_by_local_limit_never_creates_a_payin(tmp_path):
     settings = make_settings(tmp_path)
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    mock_agent_lookup(wallet.address, per_transaction_limit=0)  # any positive amount exceeds this
+    mock_agent_lookup(wallet.address, per_transaction_limit=0, allowed_tokens=[{"token_name": "pathusd"}])  # any positive amount exceeds this
 
     mock_button_methods(BUTTON_ID, FIXED_BUTTON_METHODS_RESPONSE)
     # Deliberately no mock for payin/create/by/button_id — if the engine
@@ -99,7 +99,7 @@ def test_pay_via_pay_button_rejected_by_local_limit_never_creates_a_payin(tmp_pa
 def test_pay_via_pay_button_settles_end_to_end(tmp_path):
     settings = make_settings(tmp_path)
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    mock_agent_lookup(wallet.address)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "pathusd"}])
     respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
         return_value=httpx.Response(404)
     )

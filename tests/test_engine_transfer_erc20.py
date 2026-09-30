@@ -98,27 +98,26 @@ def test_transfer_erc20_resolves_contract_and_network_by_token_name(tmp_path):
 
 
 @respx.mock
-def test_transfer_erc20_falls_back_to_default_token_contract_when_agent_has_no_payout_tokens(tmp_path):
+def test_transfer_erc20_rejects_every_token_when_agent_has_no_payout_tokens_configured(tmp_path):
+    """An unconfigured/empty allowed_tokens means "nothing is payable",
+    never "anything is" — even with a default_token_contract still set
+    from an old setup, a token that isn't in the agent's own supported
+    list is rejected outright, never silently sent through the default's
+    contract."""
     settings = make_settings(tmp_path, default_token_contract="0x" + "bb" * 20)
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    mock_agent_lookup(wallet.address, allowed_tokens=[])  # no restriction, no payout_tokens to resolve against
-    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
-        return_value=httpx.Response(404)
-    )
+    mock_agent_lookup(wallet.address, allowed_tokens=[])
 
     agent = Agent(settings)
     try:
-        with patch.object(engine_module.erc20, "pay", return_value=PaymentResult(success=True, tx_hash="0xdefaulttx")) as mock_pay:
+        with patch.object(engine_module.erc20, "pay") as mock_pay:
             record = agent.transfer_erc20(to_address="0x" + "11" * 20, amount=Decimal("1"), token="USDC")
     finally:
         agent.close()
 
-    assert record.status == STATUS_SETTLED
-    call_kwargs = mock_pay.call_args.kwargs
-    assert call_kwargs["token_contract_address"] == "0x" + "bb" * 20
-    # No payout token matched, so the wallet's own .env network is used.
-    assert call_kwargs["chain_id"] == 42431
-    assert call_kwargs["rpc_url"] == "https://tempo-testnet.example"
+    assert record.status == STATUS_REJECTED
+    assert "not supported" in record.reason
+    mock_pay.assert_not_called()
 
 
 @respx.mock
@@ -197,3 +196,32 @@ def test_transfer_erc20_explicit_contract_override_skips_resolution_and_uses_env
     # own .env chain/rpc still apply, not the payout token's.
     assert call_kwargs["chain_id"] == 42431
     assert call_kwargs["rpc_url"] == "https://tempo-testnet.example"
+
+
+@respx.mock
+def test_transfer_erc20_forwards_explicit_gas_limit_to_adapter(tmp_path):
+    """Regression coverage for a real live failure: gas estimation itself
+    fell back to the fixed default (150k), which was still too low for a
+    271,596-gas transfer — this is the escape hatch, an explicit override
+    a human approves after seeing that exact error."""
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(
+        wallet.address,
+        allowed_tokens=[{"token_name": "pathUSD", "token_address": "0x" + "aa" * 20, "network": "tempo_mainnet", "chain": 4217, "rpc_url": "https://rpc.tempo.xyz"}],
+    )
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+
+    agent = Agent(settings)
+    try:
+        with patch.object(engine_module.erc20, "pay", return_value=PaymentResult(success=True, tx_hash="0xhighgas")) as mock_pay:
+            record = agent.transfer_erc20(
+                to_address="0x" + "11" * 20, amount=Decimal("1.5"), token="pathUSD", gas_limit=350_000,
+            )
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_SETTLED
+    assert mock_pay.call_args.kwargs["gas_limit"] == 350_000
