@@ -19,6 +19,7 @@ key are in the same room):
   signed (README section 2).
 """
 
+import os
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -27,6 +28,7 @@ from mcp.server.mcpserver import MCPServer
 from agent.config import Settings
 from agent.engine import Agent
 from agent.ledger import PaymentRecord
+from agent.serve import find_free_port
 
 mcp = MCPServer("moramba-payment-agent")
 
@@ -162,7 +164,29 @@ def list_payments(recipient: str | None = None, rail: str | None = None, limit: 
 
 
 def main() -> None:
-    mcp.run()
+    """Serves over streamable-HTTP on localhost by default, so any
+    MCP client can point at a URL instead of spawning this as a stdio
+    subprocess — still single-partner, still non-custodial: the key
+    only ever loads from this process's own local `.env`, unaffected by
+    which transport carries the tool calls.
+
+    Set MCP_TRANSPORT=stdio to fall back to the original subprocess
+    style instead. MCP_HOST/MCP_PORT override the localhost/auto-port
+    defaults (auto-port picked the same way `moramba-payment-agent-serve`
+    does, via `find_free_port`)."""
+    if os.environ.get("MCP_TRANSPORT", "streamable-http") == "stdio":
+        mcp.run(transport="stdio")
+        return
+
+    host = os.environ.get("MCP_HOST", "127.0.0.1")
+    pinned_port = os.environ.get("MCP_PORT")
+    port = int(pinned_port) if pinned_port else find_free_port(host)
+
+    print(f"moramba-payment-agent MCP server: http://{host}:{port}/mcp")
+    if not pinned_port:
+        print("(auto-selected a free port — set MCP_PORT to pin a specific one instead)")
+
+    mcp.run(transport="streamable-http", host=host, port=port)
 
 
 if __name__ == "__main__":

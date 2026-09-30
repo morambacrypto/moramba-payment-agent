@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import httpx
 import respx
+from anyio import to_thread
 from fastapi.testclient import TestClient
 
 from agent import api
@@ -77,6 +78,36 @@ def test_health_returns_wallet_address_when_agent_injected(tmp_path):
             response = client.get("/payment-agent-api/health")
         assert response.status_code == 200
         assert response.json()["wallet_address"] == agent.wallet.address
+    finally:
+        api.app.dependency_overrides.pop(api.get_agent, None)
+        agent.close()
+
+
+def test_lifespan_raises_thread_pool_limit_above_anyios_default(tmp_path, monkeypatch):
+    """Every route is sync (the rails make blocking httpx/web3 calls), so
+    concurrent throughput is capped by anyio's thread pool, not by asyncio
+    itself — this confirms startup actually raises that cap rather than
+    leaving it at anyio's default of 40."""
+    monkeypatch.delenv("AGENT_THREAD_POOL_SIZE", raising=False)
+    agent = make_agent(tmp_path)
+    api.app.dependency_overrides[api.get_agent] = lambda: agent
+    try:
+        with TestClient(api.app) as client:
+            limit = client.portal.call(lambda: to_thread.current_default_thread_limiter().total_tokens)
+        assert limit == api._DEFAULT_THREAD_POOL_SIZE
+    finally:
+        api.app.dependency_overrides.pop(api.get_agent, None)
+        agent.close()
+
+
+def test_lifespan_respects_thread_pool_size_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_THREAD_POOL_SIZE", "7")
+    agent = make_agent(tmp_path)
+    api.app.dependency_overrides[api.get_agent] = lambda: agent
+    try:
+        with TestClient(api.app) as client:
+            limit = client.portal.call(lambda: to_thread.current_default_thread_limiter().total_tokens)
+        assert limit == 7
     finally:
         api.app.dependency_overrides.pop(api.get_agent, None)
         agent.close()
@@ -265,6 +296,33 @@ def test_list_payments_endpoint_returns_ledger_history(tmp_path):
         assert len(body) == 1
         assert body[0]["rail"] == "mpp"
         assert body[0]["amount"] == "1"
+    finally:
+        api.app.dependency_overrides.pop(api.get_agent, None)
+        agent.close()
+
+
+def test_mcp_tool_server_is_reachable_on_the_same_app_at_slash_mcp(tmp_path):
+    """One process, one port for both surfaces — this is what makes
+    `/mcp` a real alternative to running `moramba-payment-agent-mcp` as a
+    separate process."""
+    agent = make_agent(tmp_path)
+    api.app.dependency_overrides[api.get_agent] = lambda: agent
+    try:
+        # DNS-rebinding protection auto-enables for a localhost mount and
+        # only allows `127.0.0.1`/`localhost`/`[::1]` Host headers —
+        # TestClient's default base_url ("testserver") gets rejected
+        # (421), so point it at a permitted host instead.
+        with TestClient(api.app, base_url="http://127.0.0.1:8000") as client:
+            response = client.post(
+                "/mcp/",
+                headers={"Accept": "application/json, text/event-stream"},
+                json={
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "1.0"}},
+                },
+            )
+        assert response.status_code == 200
+        assert "moramba-payment-agent" in response.text
     finally:
         api.app.dependency_overrides.pop(api.get_agent, None)
         agent.close()

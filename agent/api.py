@@ -6,15 +6,26 @@ partner's own machine/network — not a multi-tenant API. The engine
 translation of HTTP in, `Agent` method call, HTTP out. No route
 re-implements the limit check — that would defeat the entire point of
 the "hands enforce limits in code" design (README section 2).
+
+The MCP tool server (`agent/mcp_server.py`) is mounted at `/mcp` below,
+so one process on one port serves both surfaces — a partner doesn't run
+two separate services for the same wallet. `mcp_server._agent` is set to
+the same `Agent` instance created here (see `lifespan`) rather than
+letting the MCP server lazily build its own, so there's exactly one
+wallet/DB connection per process, not two.
 """
 
 import logging
-from contextlib import asynccontextmanager
+import os
+from contextlib import AsyncExitStack, asynccontextmanager
 from decimal import Decimal, InvalidOperation
 
+from anyio import to_thread
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from pydantic import BaseModel
+from starlette.routing import Mount
 
+from agent import mcp_server
 from agent.config import Settings
 from agent.engine import Agent
 from agent.ledger import PaymentRecord
@@ -23,21 +34,49 @@ logger = logging.getLogger("agent.api")
 
 _agent: Agent | None = None
 
+# Every route below is `def`, not `async def` — every rail (mpp/erc20/
+# x402/ap2/pay_button/agent_transfer) makes blocking httpx/web3 calls, so
+# sync routes are the honest signature. FastAPI/Starlette still runs each
+# one concurrently, off a thread pool (`anyio.to_thread`), but that
+# pool's default size (40) caps how many payments can be in flight at
+# once before later requests start queuing behind it. Raise it here so
+# concurrent throughput isn't capped by a default meant for general web
+# handlers.
+_DEFAULT_THREAD_POOL_SIZE = 100
+
+# `Mount.app` is reassigned fresh on every lifespan start (see `lifespan`
+# below) rather than built once here — a `StreamableHTTPSessionManager`
+# can only be `.run()` once per instance, so the same app object can't
+# survive a second startup (a real process only starts once, but the
+# test suite starts/stops this same `app` many times).
+_mcp_mount = Mount("/mcp", app=mcp_server.mcp.streamable_http_app(streamable_http_path="/"))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _agent
-    try:
-        _agent = Agent(Settings())
-    except Exception as exc:  # noqa: BLE001 - a misconfigured .env shouldn't crash-loop the service
-        logger.error("failed to initialize Agent from Settings(): %s", exc)
-        _agent = None
-    try:
-        yield
-    finally:
-        if _agent is not None:
-            _agent.close()
-        _agent = None
+    pool_size = int(os.environ.get("AGENT_THREAD_POOL_SIZE", _DEFAULT_THREAD_POOL_SIZE))
+    to_thread.current_default_thread_limiter().total_tokens = pool_size
+    mcp_app = mcp_server.mcp.streamable_http_app(streamable_http_path="/")
+    _mcp_mount.app = mcp_app
+    async with AsyncExitStack() as stack:
+        # The MCP session manager's own lifespan isn't run automatically
+        # just because its app is mounted — Starlette doesn't cascade
+        # sub-app lifespans, so it has to be entered explicitly here.
+        await stack.enter_async_context(mcp_app.router.lifespan_context(mcp_app))
+        try:
+            _agent = Agent(Settings())
+        except Exception as exc:  # noqa: BLE001 - a misconfigured .env shouldn't crash-loop the service
+            logger.error("failed to initialize Agent from Settings(): %s", exc)
+            _agent = None
+        mcp_server._agent = _agent
+        try:
+            yield
+        finally:
+            if _agent is not None:
+                _agent.close()
+            _agent = None
+            mcp_server._agent = None
 
 
 def get_agent() -> Agent:
@@ -217,3 +256,4 @@ def list_payments(
 
 
 app.include_router(router)
+app.router.routes.append(_mcp_mount)

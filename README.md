@@ -79,7 +79,8 @@ record = agent.pay_via_mpp(
 print(record.status, record.tx_hash)
 ```
 
-As an HTTP service (section 6, "Surfaces"):
+As an HTTP service, which also serves the MCP tool server on the same
+port (section 6, "Surfaces"):
 
 ```
 moramba-payment-agent-serve   # auto-picks a free port and prints it — no port conflict to debug
@@ -88,7 +89,11 @@ moramba-payment-agent-serve   # auto-picks a free port and prints it — no port
 (prints something like `Starting moramba-payment-agent on http://127.0.0.1:54321`;
 set `PORT`/`HOST` env vars to pin a specific address instead, or use
 `uvicorn agent.api:app --reload` directly if you want `--reload` for
-local development.)
+local development. Set `AGENT_THREAD_POOL_SIZE` to raise how many
+payments can be in flight at once — every route is sync, since each
+rail makes blocking httpx/web3 calls, so concurrency comes from a
+thread pool rather than asyncio; the default is 100, well above
+anyio's own default of 40.)
 
 ```
 curl -X POST localhost:PORT/payment-agent-api/pay/mpp -H "Content-Type: application/json" -d '{
@@ -106,17 +111,21 @@ As an MCP tool server, e.g. for Claude Desktop — add to its config:
 {
   "mcpServers": {
     "moramba-payment-agent": {
-      "command": "/absolute/path/to/.venv/bin/moramba-payment-agent-mcp"
+      "url": "http://127.0.0.1:PORT/mcp/"
     }
   }
 }
 ```
 
-(once installed via `pip install -e .`, the console script already knows
-where the package lives — no `args`/`cwd` needed. The old
-`python -m agent.mcp_server` form with explicit `args`/`cwd` still works
-too, e.g. if you'd rather point at a source checkout than an installed
-package.)
+One process, one port, one wallet: `moramba-payment-agent-serve` mounts
+the same MCP tool server at `/mcp` (they share a single `Agent`
+instance, so there's one DB/ledger connection, not two) — a partner
+doesn't run a second process just to expose the MCP surface. Prefer a
+standalone MCP process instead (its own auto-picked port, via
+`moramba-payment-agent-mcp`), or the original stdio-subprocess form
+(`"command": "/absolute/path/to/.venv/bin/moramba-payment-agent-mcp"`,
+with `MCP_TRANSPORT=stdio` set) if your MCP client can't connect over
+HTTP.
 
 No key or secret goes in that config — the `.env` lives in `cwd` and is
 read once when the process starts (README section 7).
@@ -206,7 +215,7 @@ Three ways to run the same core engine (all share one Python package):
 |---|---|---|
 | **Library** | a developer embedding payment logic in their own Python app | `from moramba_payment_agent import Agent` |
 | **FastAPI service** | a partner's own backend calling it over HTTP, on their own network | all under `/payment-agent-api`: `POST pay/mpp`, `POST pay/x402`, `POST pay/ap2`, `POST pay/button`, `POST pay/agent`, `POST transfer`, `POST limits/check`, `GET payments`, `GET health` |
-| **MCP tool server** | any MCP-compatible AI chat client (Claude Desktop, ChatGPT) | tools: `pay_via_ap2`, `pay_via_x402`, `pay_via_mpp`, `pay_via_pay_button`, `pay_agent`, `transfer_erc20`, `check_spend_limits`, `list_payments` |
+| **MCP tool server** | any MCP-compatible AI chat client (Claude Desktop, ChatGPT) | tools: `pay_via_ap2`, `pay_via_x402`, `pay_via_mpp`, `pay_via_pay_button`, `pay_agent`, `transfer_erc20`, `check_spend_limits`, `list_payments` — served at `/mcp` on the FastAPI service's own port (or standalone via `moramba-payment-agent-mcp`) |
 
 ## 4. Supported payment rails
 
@@ -516,8 +525,8 @@ LLM and a private key are in the same room:
 - **No tool's input schema ever includes the key.** The LLM only ever
   passes business parameters (`merchant_url`, `amount`, `token`).
 - The key is **not** placed in the MCP client's config (e.g. Claude
-  Desktop's `claude_desktop_config.json` only needs the command to
-  launch our server — not the key itself).
+  Desktop's `claude_desktop_config.json` only needs the server's URL, or
+  the command to launch it in stdio mode — not the key itself).
 - The spend-limit check runs unconditionally inside the tool handler, in
   code — the LLM cannot skip it by phrasing a request differently.
 

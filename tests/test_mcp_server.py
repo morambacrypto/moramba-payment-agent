@@ -194,6 +194,37 @@ def test_pay_via_pay_button_tool_rejects_by_local_limit(tmp_path):
         agent.close()
 
 
+def test_main_defaults_to_streamable_http_on_localhost_with_auto_port(monkeypatch):
+    monkeypatch.delenv("MCP_TRANSPORT", raising=False)
+    monkeypatch.delenv("MCP_HOST", raising=False)
+    monkeypatch.delenv("MCP_PORT", raising=False)
+    with patch.object(mcp_server, "find_free_port", return_value=54322) as mock_find, \
+         patch.object(mcp_server.mcp, "run") as mock_run:
+        mcp_server.main()
+
+    mock_find.assert_called_once()
+    mock_run.assert_called_once_with(transport="streamable-http", host="127.0.0.1", port=54322)
+
+
+def test_main_uses_pinned_mcp_port_without_calling_find_free_port(monkeypatch):
+    monkeypatch.delenv("MCP_TRANSPORT", raising=False)
+    monkeypatch.setenv("MCP_PORT", "9998")
+    with patch.object(mcp_server, "find_free_port") as mock_find, \
+         patch.object(mcp_server.mcp, "run") as mock_run:
+        mcp_server.main()
+
+    mock_find.assert_not_called()
+    mock_run.assert_called_once_with(transport="streamable-http", host="127.0.0.1", port=9998)
+
+
+def test_main_falls_back_to_stdio_when_mcp_transport_env_set(monkeypatch):
+    monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    with patch.object(mcp_server.mcp, "run") as mock_run:
+        mcp_server.main()
+
+    mock_run.assert_called_once_with(transport="stdio")
+
+
 def test_pay_agent_tool_settles(tmp_path):
     agent = make_agent(tmp_path)
     receiving_agent_id = "77777777-7777-7777-7777-777777777777"
