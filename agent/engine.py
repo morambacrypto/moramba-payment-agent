@@ -96,12 +96,25 @@ class Agent:
         amount: Decimal,
         token: str,
         token_contract_address: str | None = None,
+        gas_limit: int | None = None,
     ) -> PaymentRecord:
         """Every token this agent is configured for is payable by name —
-        not only the one contract address baked into
-        `DEFAULT_TOKEN_CONTRACT` at setup time. `token_contract_address`
-        still overrides both the contract and (implicitly) the network,
-        for a token this agent doesn't have in its own payout_tokens."""
+        the agent only ever pays what it's explicitly configured for,
+        never an arbitrary token, so an unresolvable `token` is rejected
+        outright rather than falling back to any single default contract
+        (an unconfigured/empty payout_tokens list means "nothing is
+        payable", not "anything is"). `token_contract_address` still
+        overrides the contract address directly, but `check_spend_limits`
+        below still enforces the same rule on `token`'s name regardless.
+
+        `gas_limit` is normally left unset — `erc20.pay` estimates it live
+        per-transaction. It exists as an explicit escape hatch for when
+        that estimate itself isn't obtainable (some RPC nodes don't
+        support `eth_estimateGas` reliably) and the safety-net fallback
+        undershoots a specific token's real cost — a caller (or an AI
+        agent, after getting a human's go-ahead, since this raises how
+        much a single transfer can spend on gas) can then retry with an
+        explicit value instead of failing the same way indefinitely."""
         chain_id = self._settings.chain_id
         rpc_url = self._settings.rpc_url
         contract_address = token_contract_address
@@ -118,28 +131,17 @@ class Agent:
                     # the token's own chain/rpc when Moramba reports one.
                     chain_id = resolved.chain
                     rpc_url = resolved.rpc_url
-            elif limits.payout_tokens:
-                # The agent DOES have a specific, restricted set of
-                # tokens and this one isn't in it — reject directly
-                # rather than silently falling back to a default
-                # contract that belongs to a different token entirely.
+            else:
                 accepted = [t.token_name for t in limits.payout_tokens]
+                reason = (
+                    f"token {token!r} is not supported by this agent — accepts: {accepted}"
+                    if accepted
+                    else f"token {token!r} is not supported — this agent has no payout tokens configured"
+                )
                 return self.ledger.record(
                     rail="erc20", recipient=to_address, token=token, amount=amount,
-                    status=STATUS_REJECTED,
-                    reason=f"token {token!r} is not supported by this agent — accepts: {accepted}",
+                    status=STATUS_REJECTED, reason=reason,
                 )
-            else:
-                # No restriction configured at all — fall back to the
-                # single legacy default, same as before this method knew
-                # how to resolve tokens by name.
-                contract_address = self._settings.default_token_contract
-
-        if not contract_address:
-            return self.ledger.record(
-                rail="erc20", recipient=to_address, token=token, amount=amount,
-                status=STATUS_REJECTED, reason="no token_contract_address given and no default_token_contract configured",
-            )
 
         check = self.check_spend_limits(recipient=to_address, token=token, amount=amount, rail="erc20")
         if not check.allowed:
@@ -155,6 +157,7 @@ class Agent:
             token_contract_address=contract_address,
             to_address=to_address,
             amount=amount,
+            gas_limit=gas_limit,
         )
         record = self.ledger.record(
             rail="erc20", recipient=to_address, token=token, amount=amount,

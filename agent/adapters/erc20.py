@@ -3,12 +3,15 @@ protocol. Still goes through the same signing wallet and is still
 subject to the same limit check as every other rail (see engine.py);
 this module only builds, signs and broadcasts the transaction."""
 
+import logging
 from decimal import Decimal
 
 from eth_account.signers.local import LocalAccount
 from web3 import Web3
 
 from agent.adapters.base import PaymentResult
+
+logger = logging.getLogger(__name__)
 
 _ERC20_ABI = [
     {
@@ -66,7 +69,15 @@ def pay(
             # the node what this specific call actually costs instead.
             try:
                 gas_limit = int(transfer_call.estimate_gas({"from": account.address}) * _GAS_ESTIMATE_MARGIN)
-            except Exception:  # noqa: BLE001 - estimation itself can fail independently of the real transfer
+            except Exception as exc:  # noqa: BLE001 - estimation itself can fail independently of the real transfer
+                # Otherwise this looks identical to "the node estimated
+                # ~150k" in the logs, when what actually happened is the
+                # RPC couldn't estimate at all — worth telling apart when
+                # the fallback then also turns out too low.
+                logger.warning(
+                    "gas estimation failed for transfer to %s on chain %s, using fallback %d: %s",
+                    to_checksum, chain_id, _FALLBACK_GAS_LIMIT, exc,
+                )
                 gas_limit = _FALLBACK_GAS_LIMIT
         tx = transfer_call.build_transaction(
             {

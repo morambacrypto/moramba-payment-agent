@@ -94,7 +94,12 @@ class LimitChecker:
         # "pathUSD" while a button's payment_token_name can come through
         # as "pathusd" (real production data, 2026-09-29) — an exact
         # match would reject a legitimately-allowed token.
-        if limits.allowed_tokens and token.lower() not in {t.lower() for t in limits.allowed_tokens}:
+        #
+        # An empty allowed_tokens means "nothing is configured", not "no
+        # restriction" — the agent only ever pays in what it explicitly
+        # supports, across every rail; an unconfigured list rejects every
+        # token rather than silently allowing all of them.
+        if token.lower() not in {t.lower() for t in limits.allowed_tokens}:
             return LimitCheckResult(False, f"token {token!r} is not in this agent's allowed_tokens")
 
         if limits.per_transaction_limit is not None and amount > Decimal(limits.per_transaction_limit):

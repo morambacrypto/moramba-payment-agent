@@ -4,7 +4,7 @@
 x402, AP2 (Autonomous), Moramba Pay Button, and Agent Transfer (pay any
 Moramba agent directly by id) — plus the local ledger, the live limit
 check, a FastAPI service wrapper, the setup wizard, and the MCP tool
-server, all with a passing test suite (119 tests). Packaged as a proper
+server, all with a passing test suite (122 tests). Packaged as a proper
 pip-installable project (`pyproject.toml`) so a partner can
 `pip install -e .` instead of running from source on `PYTHONPATH`; Docker
 packaging was dropped — not needed for this project. The setup wizard now
@@ -34,7 +34,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 119 tests, all passing
+python -m pytest -q          # 122 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -52,14 +52,16 @@ comes from your agent's own Moramba config:
    match, it offers to retry with a different key rather than silently
    writing a config that would reject every payment.
 3. **Your Moramba ACP API key** (for the AP2 rail).
-4. **A local ledger path.**
 
 Network (`CHAIN_ID`/`RPC_URL`) and the ERC20 rail's default token
 contract are auto-detected from the agent's own configured payout token
 — you're only asked for the network manually if Moramba couldn't be
-reached during setup. Every rail is always enabled; there's no "which
-rails do you want" step, and no prompt in the whole wizard accepts a
-blank answer as "use the default" — everything that's asked is required.
+reached during setup. The local ledger isn't asked either — it's always
+`moramba_payment_agent.db`, next to wherever the wizard runs from (the
+same default `Settings.db_path` itself falls back to). Every rail is
+always enabled; there's no "which rails do you want" step, and no prompt
+in the whole wizard accepts a blank answer as "use the default" —
+everything that's still asked is required.
 
 As a library:
 
@@ -176,6 +178,12 @@ everything else.
   agent actually made under its own limit checks. A shared wallet
   quietly breaks the whole limits/audit story built on top of it, so the
   setup wizard treats this as a requirement, not a suggestion.
+- **Only a supported token is ever payable — never an arbitrary one.**
+  Every rail's `token` argument is checked against this agent's own
+  `payout_config.allowed_tokens`, read live on every attempt (same call
+  as the limits above). An unconfigured/empty list means *nothing* is
+  payable, not "no restriction" — an agent only ever spends in what
+  Moramba explicitly configured it for.
 
 ## 3. Architecture
 
@@ -426,18 +434,26 @@ transfer, still gated by the same local limit check.
 tokens (`GET .../public/agent`'s `payout_config.allowed_tokens`) — every
 token the agent supports is payable this way, each on its own
 chain/RPC, not only the one contract address written to
-`DEFAULT_TOKEN_CONTRACT` at setup time. If the agent has a specific,
-restricted token list and the requested `token` isn't in it, the
-transfer is rejected outright ("not supported by this agent") rather
-than silently falling back to a default contract that belongs to a
-different token — the fallback only applies when the agent has no
-token restriction configured at all. An explicit
-`token_contract_address` still overrides resolution entirely (and then
-uses the wallet's own `.env` chain/RPC, since there's no other network
-to infer it from). Gas is estimated live per-transaction (node's own
+`DEFAULT_TOKEN_CONTRACT` at setup time. A `token` this agent isn't
+configured for is rejected outright ("not supported by this agent"), an
+unconfigured/empty token list rejects every token rather than allowing
+any of them through (README section 2) — there is no fallback contract
+for an unrecognized token. An explicit `token_contract_address` still
+overrides which contract address gets called, but `token`'s name is
+still checked against `allowed_tokens` regardless, and it still uses the
+wallet's own `.env` chain/RPC, since there's no other network to infer
+it from. Gas is estimated live per-transaction (node's own
 `eth_estimateGas` + 20% margin), not a fixed guess — found live
 (2026-09-30): a token needing ~271k gas was rejected against a
-hardcoded 100k limit.
+hardcoded 100k limit. If the RPC node's own estimate itself isn't
+obtainable, a fixed fallback (150k) is used and a warning is logged
+naming which — this fallback can still undershoot a specific token's
+real cost, as happened live even after the fix above (needed ~271k,
+got the 150k fallback because estimation itself failed on that node).
+For that case, `transfer_erc20` also takes an explicit `gas_limit`
+override — meant to be set only after a failed attempt's error names
+the actual gas needed, and only with a human's go-ahead (an AI agent
+calling this as a tool should ask before raising it, not decide alone).
 
 ### Network
 **Tempo testnet (chain id 42431) first.** Mainnet and other chains are a

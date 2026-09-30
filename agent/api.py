@@ -131,6 +131,10 @@ class TransferRequest(BaseModel):
     amount: str
     token: str
     token_contract_address: str | None = None
+    # Normally left unset — gas is estimated live per-transaction. Only
+    # needed as an explicit override when that estimate/its fallback
+    # undershoots a specific token's real cost (see engine.transfer_erc20).
+    gas_limit: int | None = None
 
 
 class X402PayRequest(BaseModel):
@@ -193,6 +197,7 @@ def transfer(req: TransferRequest, agent: Agent = Depends(get_agent)):
         amount=_parse_amount(req.amount),
         token=req.token,
         token_contract_address=req.token_contract_address,
+        gas_limit=req.gas_limit,
     )
     return _record_to_dict(record)
 

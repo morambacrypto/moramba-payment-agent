@@ -89,7 +89,7 @@ def make_payment_required() -> PaymentRequired:
 def test_pay_via_x402_settles_and_records_ledger_entry(tmp_path):
     settings = make_settings(tmp_path)
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    mock_agent_lookup(wallet.address)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "USD Coin"}])
     respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
         return_value=httpx.Response(404)
     )
@@ -140,7 +140,7 @@ def test_pay_via_x402_returns_none_when_no_payment_required(tmp_path):
 def test_pay_via_x402_rejected_by_local_limit_never_signs_or_retries(tmp_path):
     settings = make_settings(tmp_path)
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    mock_agent_lookup(wallet.address, per_transaction_limit=0)  # any positive amount exceeds this
+    mock_agent_lookup(wallet.address, per_transaction_limit=0, allowed_tokens=[{"token_name": "USD Coin"}])  # any positive amount exceeds this
 
     header_value = encode_payment_required_header(make_payment_required())
 
