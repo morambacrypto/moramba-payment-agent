@@ -155,12 +155,32 @@ def _resolve_port(host: str, port: int) -> int | None:
     return port if _is_port_free(host, port) else None
 
 
-def _watch_tunnel_output(process: subprocess.Popen) -> None:
+def _watch_tunnel_output(process: subprocess.Popen, url_ready: threading.Event) -> None:
     for line in process.stdout:
         match = _TRYCLOUDFLARE_URL_RE.search(line)
         if match:
+            url_ready.set()
             print(f"MCP URL (for Claude's web app, via Cloudflare quick tunnel): {match.group(0)}/mcp")
             return
+
+
+def _announce_tunnel_pending(host: str, port: int, url_ready: threading.Event, wait_seconds: float = 30.0) -> None:
+    """Prints a "tunnel is being created" note once uvicorn is actually
+    listening — so it lands right after uvicorn's own "Uvicorn running on
+    ..." line instead of before it, where it would be easy to miss — but
+    only if the public URL hasn't already shown up by then (the tunnel
+    can take several seconds, so usually it hasn't)."""
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        return
+    if not url_ready.is_set():
+        print("Creating the Cloudflare tunnel — this takes a few seconds, the public MCP URL will print here when it's ready...")
 
 
 def _cloudflared_release_asset() -> tuple[str, bool] | None:
@@ -272,7 +292,9 @@ def _start_quick_tunnel(host: str, port: int) -> subprocess.Popen | None:
         print(f"TUNNEL=1: failed to start cloudflared ({exc}) — serving locally only.")
         return None
 
-    threading.Thread(target=_watch_tunnel_output, args=(process,), daemon=True).start()
+    url_ready = threading.Event()
+    threading.Thread(target=_watch_tunnel_output, args=(process, url_ready), daemon=True).start()
+    threading.Thread(target=_announce_tunnel_pending, args=(host, port, url_ready), daemon=True).start()
     return process
 
 
