@@ -1,7 +1,7 @@
 import os
 import signal
 import socket
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from agent import serve
 
@@ -228,58 +228,89 @@ def test_main_respects_host_env_var(tmp_path, monkeypatch):
     mock_run.assert_called_once_with("agent.api:app", host="0.0.0.0", port=8080)
 
 
-def test_main_defaults_to_plain_http_without_ssl_kwargs(tmp_path, monkeypatch):
-    monkeypatch.delenv("SSL", raising=False)
-    monkeypatch.setenv("PORT", "9999")
-    monkeypatch.chdir(tmp_path)
-    with patch.object(serve, "_resolve_port", return_value=9999), \
-         patch.object(serve, "_ensure_self_signed_cert") as mock_ensure_cert, \
-         patch.object(serve.uvicorn, "run") as mock_run:
-        serve.main()
+def test_watch_tunnel_output_prints_the_trycloudflare_url(capsys):
+    fake_process = MagicMock()
+    fake_process.stdout = iter([
+        "some startup noise\n",
+        "INFO | https://random-words-here.trycloudflare.com\n",
+        "this line is never reached\n",
+    ])
 
-    mock_ensure_cert.assert_not_called()
-    mock_run.assert_called_once_with("agent.api:app", host="127.0.0.1", port=9999)
+    serve._watch_tunnel_output(fake_process)
+
+    assert "https://random-words-here.trycloudflare.com" in capsys.readouterr().out
 
 
-def test_main_serves_https_when_ssl_env_var_set(tmp_path, monkeypatch):
-    monkeypatch.setenv("SSL", "1")
-    monkeypatch.setenv("PORT", "9999")
-    monkeypatch.chdir(tmp_path)
-    with patch.object(serve, "_resolve_port", return_value=9999), \
-         patch.object(serve, "_ensure_self_signed_cert") as mock_ensure_cert, \
-         patch.object(serve.uvicorn, "run") as mock_run:
-        serve.main()
+def test_watch_tunnel_output_returns_quietly_when_no_url_appears(capsys):
+    fake_process = MagicMock()
+    fake_process.stdout = iter(["no url in this output\n"])
 
-    mock_ensure_cert.assert_called_once_with(serve._CERT_FILE, serve._KEY_FILE)
-    mock_run.assert_called_once_with(
-        "agent.api:app", host="127.0.0.1", port=9999,
-        ssl_certfile=serve._CERT_FILE, ssl_keyfile=serve._KEY_FILE,
+    serve._watch_tunnel_output(fake_process)  # must not raise
+
+    assert "trycloudflare.com" not in capsys.readouterr().out
+
+
+def test_start_quick_tunnel_returns_none_when_cloudflared_is_missing(capsys):
+    with patch.object(serve.subprocess, "Popen", side_effect=FileNotFoundError):
+        result = serve._start_quick_tunnel("127.0.0.1", 58417)
+
+    assert result is None
+    assert "cloudflared" in capsys.readouterr().out.lower()
+
+
+def test_start_quick_tunnel_launches_cloudflared_with_the_right_url():
+    fake_process = MagicMock()
+    fake_process.stdout = iter([])
+    with patch.object(serve.subprocess, "Popen", return_value=fake_process) as mock_popen, \
+         patch.object(serve.threading, "Thread") as mock_thread:
+        result = serve._start_quick_tunnel("127.0.0.1", 58417)
+
+    assert result is fake_process
+    mock_popen.assert_called_once_with(
+        ["cloudflared", "tunnel", "--url", "http://127.0.0.1:58417"],
+        stdout=serve.subprocess.PIPE, stderr=serve.subprocess.STDOUT, text=True, bufsize=1,
     )
+    mock_thread.assert_called_once()
+    assert mock_thread.call_args.kwargs.get("daemon") is True
 
 
-def test_ensure_self_signed_cert_generates_a_loadable_cert(tmp_path, monkeypatch):
+def test_main_does_not_start_a_tunnel_without_tunnel_env_var(tmp_path, monkeypatch):
+    monkeypatch.delenv("TUNNEL", raising=False)
+    monkeypatch.setenv("PORT", "9999")
     monkeypatch.chdir(tmp_path)
-    cert_path, key_path = "cert.pem", "key.pem"
+    with patch.object(serve, "_resolve_port", return_value=9999), \
+         patch.object(serve, "_start_quick_tunnel") as mock_start_tunnel, \
+         patch.object(serve.uvicorn, "run"):
+        serve.main()
 
-    serve._ensure_self_signed_cert(cert_path, key_path)
-
-    assert (tmp_path / cert_path).exists()
-    assert (tmp_path / key_path).exists()
-    assert oct((tmp_path / key_path).stat().st_mode)[-3:] == "600"
-
-    import ssl as ssl_module
-    ctx = ssl_module.SSLContext(ssl_module.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(cert_path, key_path)  # must not raise
+    mock_start_tunnel.assert_not_called()
 
 
-def test_ensure_self_signed_cert_does_not_regenerate_when_already_present(tmp_path, monkeypatch):
+def test_main_starts_and_terminates_the_tunnel_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("TUNNEL", "1")
+    monkeypatch.setenv("PORT", "9999")
     monkeypatch.chdir(tmp_path)
-    cert_path, key_path = "cert.pem", "key.pem"
+    fake_tunnel_process = MagicMock()
+    with patch.object(serve, "_resolve_port", return_value=9999), \
+         patch.object(serve, "_start_quick_tunnel", return_value=fake_tunnel_process) as mock_start_tunnel, \
+         patch.object(serve.uvicorn, "run"):
+        serve.main()
 
-    serve._ensure_self_signed_cert(cert_path, key_path)
-    first_cert_bytes = (tmp_path / cert_path).read_bytes()
+    mock_start_tunnel.assert_called_once_with("127.0.0.1", 9999)
+    fake_tunnel_process.terminate.assert_called_once()
 
-    serve._ensure_self_signed_cert(cert_path, key_path)
-    second_cert_bytes = (tmp_path / cert_path).read_bytes()
 
-    assert first_cert_bytes == second_cert_bytes
+def test_main_terminates_the_tunnel_even_if_uvicorn_run_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("TUNNEL", "1")
+    monkeypatch.setenv("PORT", "9999")
+    monkeypatch.chdir(tmp_path)
+    fake_tunnel_process = MagicMock()
+    with patch.object(serve, "_resolve_port", return_value=9999), \
+         patch.object(serve, "_start_quick_tunnel", return_value=fake_tunnel_process), \
+         patch.object(serve.uvicorn, "run", side_effect=RuntimeError("boom")):
+        try:
+            serve.main()
+        except RuntimeError:
+            pass
+
+    fake_tunnel_process.terminate.assert_called_once()
