@@ -574,7 +574,16 @@ def settle_autonomous_checkout(
                 error=final_status.get("error_message") or "settlement failed on-chain",
             )
 
-        complete_checkout_session(base_url, api_key, session.session_id, buyer_email)
+        try:
+            complete_checkout_session(base_url, api_key, session.session_id, buyer_email)
+        except Ap2Error as exc:
+            # Found live (2026-10-01): by the time the on-chain payment is
+            # confirmed, Moramba has already completed the session itself
+            # (the order was recorded), so this call is a no-op conflict —
+            # not a failure. Recording it as one hid a real, settled
+            # payment as "Failed" in the ledger and Moramba's history.
+            if "already completed" not in str(exc):
+                raise
         return Ap2SettlementResult(success=True, tx_hash=final_status.get("tx_hash"), flow=flow, payin_id=payin_id)
     except Ap2Error as exc:
         # Preserve whatever we already knew — a payin may well have been
