@@ -105,6 +105,121 @@ def test_resolve_payment_plan_variable_amount_requires_caller_amount():
     assert plan.amount == Decimal("2.5")
 
 
+MULTI_TOKEN_BUTTON_METHODS_RESPONSE = {
+    "success": True, "message": "button payment methods fetched",
+    "data": {
+        "button_id": BUTTON_ID, "fixed_amount": True,
+        "methods": [
+            {
+                "payout_destination_id": "usdc-method", "network": "tempo_testnet", "token_name": "usdc",
+                "token_address": "0x" + "aa" * 20, "to_wallet_address": "0x" + "11" * 20,
+                "decimals": 6, "amount_with_decimal": "1000000", "is_default": True,
+            },
+            {
+                "payout_destination_id": "pathusd-method", "network": "tempo_testnet", "token_name": "pathUSD",
+                "token_address": "0x20c0000000000000000000000000000000000000",
+                "to_wallet_address": "0x6784f65225f7d567cf1535525b0dd720b1450d1b",
+                "decimals": 6, "amount_with_decimal": "1000000", "is_default": False,
+            },
+        ],
+    },
+}
+
+
+@respx.mock
+def test_resolve_payment_plan_defaults_to_first_method_without_preferred_tokens():
+    _mock_methods(BUTTON_ID, MULTI_TOKEN_BUTTON_METHODS_RESPONSE)
+    plan = pay_button.resolve_payment_plan(BASE_URL, BUTTON_ID)
+    assert plan.method.token_name == "usdc"
+
+
+@respx.mock
+def test_resolve_payment_plan_prefers_a_method_matching_preferred_tokens():
+    """Regression coverage: a button accepting both usdc and pathUSD
+    previously always picked usdc (index 0) regardless of which tokens
+    the paying agent actually supports."""
+    _mock_methods(BUTTON_ID, MULTI_TOKEN_BUTTON_METHODS_RESPONSE)
+    plan = pay_button.resolve_payment_plan(BASE_URL, BUTTON_ID, preferred_tokens=["pathUSD"])
+    assert plan.method.token_name == "pathUSD"
+    assert plan.method.to_wallet_address == "0x6784f65225f7d567cf1535525b0dd720b1450d1b"
+
+
+@respx.mock
+def test_resolve_payment_plan_preferred_tokens_is_case_insensitive():
+    _mock_methods(BUTTON_ID, MULTI_TOKEN_BUTTON_METHODS_RESPONSE)
+    plan = pay_button.resolve_payment_plan(BASE_URL, BUTTON_ID, preferred_tokens=["pathusd"])
+    assert plan.method.token_name == "pathUSD"
+
+
+@respx.mock
+def test_resolve_payment_plan_falls_back_to_first_method_when_no_preferred_token_matches():
+    _mock_methods(BUTTON_ID, MULTI_TOKEN_BUTTON_METHODS_RESPONSE)
+    plan = pay_button.resolve_payment_plan(BASE_URL, BUTTON_ID, preferred_tokens=["DAI"])
+    assert plan.method.token_name == "usdc"
+
+
+@respx.mock
+def test_resolve_payment_plan_network_wins_over_preferred_tokens():
+    _mock_methods(BUTTON_ID, MULTI_TOKEN_BUTTON_METHODS_RESPONSE)
+    # Both methods are on the same network here, but this confirms an
+    # explicit network selection is never overridden by token preference.
+    plan = pay_button.resolve_payment_plan(
+        BASE_URL, BUTTON_ID, network="tempo_testnet", preferred_tokens=["pathUSD"]
+    )
+    assert plan.method.token_name == "usdc"  # first match for that network
+
+
+MULTI_NETWORK_SAME_TOKEN_BUTTON_METHODS_RESPONSE = {
+    "success": True, "message": "button payment methods fetched",
+    "data": {
+        "button_id": BUTTON_ID, "fixed_amount": True,
+        "methods": [
+            {
+                "payout_destination_id": "pathusd-mainnet", "network": "tempo_mainnet", "token_name": "pathUSD",
+                "token_address": "0x" + "bb" * 20, "to_wallet_address": "0x" + "22" * 20,
+                "decimals": 6, "amount_with_decimal": "1000000", "is_default": True,
+            },
+            {
+                "payout_destination_id": "pathusd-testnet", "network": "tempo_testnet", "token_name": "pathUSD",
+                "token_address": "0x20c0000000000000000000000000000000000000",
+                "to_wallet_address": "0x6784f65225f7d567cf1535525b0dd720b1450d1b",
+                "decimals": 6, "amount_with_decimal": "1000000", "is_default": False,
+            },
+        ],
+    },
+}
+
+
+@respx.mock
+def test_resolve_payment_plan_prefers_network_hint_when_token_matches_multiple_methods():
+    """The same preferred token can exist on more than one network (e.g.
+    pathUSD on both testnet and mainnet) — preferred_network_hint breaks
+    that tie using the agent's own configured chain, since
+    ButtonPayoutMethod carries no chain id to match on directly."""
+    _mock_methods(BUTTON_ID, MULTI_NETWORK_SAME_TOKEN_BUTTON_METHODS_RESPONSE)
+    plan = pay_button.resolve_payment_plan(
+        BASE_URL, BUTTON_ID, preferred_tokens=["pathUSD"], preferred_network_hint="testnet"
+    )
+    assert plan.method.network == "tempo_testnet"
+    assert plan.method.to_wallet_address == "0x6784f65225f7d567cf1535525b0dd720b1450d1b"
+
+
+@respx.mock
+def test_resolve_payment_plan_without_network_hint_takes_first_matching_token():
+    _mock_methods(BUTTON_ID, MULTI_NETWORK_SAME_TOKEN_BUTTON_METHODS_RESPONSE)
+    plan = pay_button.resolve_payment_plan(BASE_URL, BUTTON_ID, preferred_tokens=["pathUSD"])
+    assert plan.method.network == "tempo_mainnet"  # first configured match, no tiebreaker given
+
+
+@respx.mock
+def test_resolve_payment_plan_falls_back_when_network_hint_matches_nothing():
+    _mock_methods(BUTTON_ID, MULTI_NETWORK_SAME_TOKEN_BUTTON_METHODS_RESPONSE)
+    plan = pay_button.resolve_payment_plan(
+        BASE_URL, BUTTON_ID, preferred_tokens=["pathUSD"], preferred_network_hint="devnet"
+    )
+    assert plan.method.network == "tempo_mainnet"  # no method's network contains "devnet" — first match stands
+
+
 @respx.mock
 def test_create_payin_by_button_id_sends_expected_body_and_omits_amount_when_none():
     route = respx.post(f"{BASE_URL}/api/v2/morambacrypto/public/payin/create/by/button_id/{BUTTON_ID}").mock(

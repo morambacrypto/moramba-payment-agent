@@ -17,6 +17,25 @@ from agent.signing import Wallet, load_wallet
 from agent.sync import SyncClient
 
 
+# Same Tempo testnet/mainnet chain ids as setup.py's KNOWN_CHAIN_RPCS —
+# used both to break a tie when a pay-button method exists for the same
+# preferred token on more than one network, and to hard-reject a
+# resolved method whose network doesn't match what this agent is
+# actually configured for on that token (see pay_via_pay_button).
+_CHAIN_NETWORK_HINT: dict[int, str] = {
+    42431: "testnet",
+    4217: "mainnet",
+}
+
+
+def _network_slug_hint(network_slug: str) -> str | None:
+    """`ButtonPayoutMethod.network` is a slug like "tempo_testnet" with no
+    chain id attached — this is the only way to tell which of
+    _CHAIN_NETWORK_HINT's chains it corresponds to."""
+    lowered = network_slug.lower()
+    return next((hint for hint in _CHAIN_NETWORK_HINT.values() if hint in lowered), None)
+
+
 def _parse_caip2_chain_id(network: str) -> int | None:
     """"eip155:84532" -> 84532. Returns None for a network id this doesn't
     recognize rather than raising — chain_id is informational on the
@@ -366,10 +385,31 @@ class Agent:
         (`pay_button_adapter.pay_button`) is a real, one-shot server-side
         side effect. The limit check has to run between those two steps,
         so a rejection never causes that side effect.
+
+        When `network` isn't given, a multi-token (and/or multi-network)
+        button's method is chosen to match this agent's own
+        `allowed_tokens` where possible — a button that accepts several
+        tokens, or the same token on more than one network, shouldn't get
+        paid via whichever method happens to be listed first if that one
+        isn't actually usable by this agent. That preference is then
+        enforced, not just hoped for: the resolved method's network must
+        match this specific token's own configured chain, or the payment
+        is rejected outright rather than settling on a network this agent
+        isn't actually allowed to use it on (an explicit `network` is
+        trusted as the caller's own deliberate choice and skips this).
         """
+        limits = None
+        preferred_tokens = None
+        preferred_network_hint = None
+        if network is None:
+            limits = self._agents_client.get_agent(self._settings.moramba_agent_id)
+            preferred_tokens = limits.allowed_tokens
+            preferred_network_hint = _CHAIN_NETWORK_HINT.get(self._settings.chain_id)
+
         try:
             plan = pay_button_adapter.resolve_payment_plan(
-                self._settings.moramba_api_base_url, button_id, network=network, amount=amount
+                self._settings.moramba_api_base_url, button_id, network=network, amount=amount,
+                preferred_tokens=preferred_tokens, preferred_network_hint=preferred_network_hint,
             )
         except pay_button_adapter.Ap2Error as exc:
             return self.ledger.record(
@@ -379,6 +419,22 @@ class Agent:
 
         recipient = plan.method.to_wallet_address
         token = plan.method.token_name
+
+        if limits is not None:
+            matched_token = limits.resolve_payout_token(token)
+            if matched_token is not None:
+                method_hint = _network_slug_hint(plan.method.network)
+                token_hint = _CHAIN_NETWORK_HINT.get(matched_token.chain)
+                if method_hint and token_hint and method_hint != token_hint:
+                    return self.ledger.record(
+                        rail="pay_button", recipient=recipient, token=token, amount=plan.amount,
+                        status=STATUS_REJECTED,
+                        reason=(
+                            f"button's {token!r} method is on {plan.method.network!r}, but this agent's "
+                            f"{token!r} is configured for chain {matched_token.chain} ({token_hint})"
+                        ),
+                        raw_request={"button_id": button_id, "network": plan.method.network},
+                    )
 
         check = self.check_spend_limits(recipient=recipient, token=token, amount=plan.amount, rail="pay_button")
         if not check.allowed:

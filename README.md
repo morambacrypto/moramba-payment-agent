@@ -4,7 +4,7 @@
 x402, AP2 (Autonomous), Moramba Pay Button, and Agent Transfer (pay any
 Moramba agent directly by id) — plus the local ledger, the live limit
 check, a FastAPI service wrapper, the setup wizard, and the MCP tool
-server, all with a passing test suite (122 tests). Packaged as a proper
+server, all with a passing test suite (132 tests). Packaged as a proper
 pip-installable project (`pyproject.toml`) so a partner can
 `pip install -e .` instead of running from source on `PYTHONPATH`; Docker
 packaging was dropped — not needed for this project. The setup wizard now
@@ -34,7 +34,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 122 tests, all passing
+python -m pytest -q          # 132 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -178,12 +178,16 @@ everything else.
   agent actually made under its own limit checks. A shared wallet
   quietly breaks the whole limits/audit story built on top of it, so the
   setup wizard treats this as a requirement, not a suggestion.
-- **Only a supported token is ever payable — never an arbitrary one.**
-  Every rail's `token` argument is checked against this agent's own
-  `payout_config.allowed_tokens`, read live on every attempt (same call
-  as the limits above). An unconfigured/empty list means *nothing* is
-  payable, not "no restriction" — an agent only ever spends in what
-  Moramba explicitly configured it for.
+- **Only a supported token, on a supported network, is ever payable —
+  never an arbitrary one.** Every rail's `token` argument is checked
+  against this agent's own `payout_config.allowed_tokens`, read live on
+  every attempt (same call as the limits above). An unconfigured/empty
+  list means *nothing* is payable, not "no restriction" — an agent only
+  ever spends in what Moramba explicitly configured it for. The Pay
+  Button rail (section 4) extends this to the network as well: a
+  multi-network button's method for a supported token is still rejected
+  if that specific method isn't on the chain this agent is configured
+  for on that token.
 
 ## 3. Architecture
 
@@ -375,6 +379,29 @@ real flow below was verified live against a running local server
 5. **Public, unauthenticated** — same "the `payin_id` itself is the
    capability" model as every other `payrequest/*` endpoint; no API key
    needed for either the create-payin or the init call.
+6. **Method selection prefers, then enforces, the agent's own
+   token/network.** A button can list several payout methods (one per
+   network/token); found live (2026-10-01): a button accepting both
+   `usdc` and `pathUSD` always picked `usdc` (`payout_methods[0]`)
+   regardless of which tokens the paying agent actually had in its own
+   `allowed_tokens`, so an agent only configured for `pathUSD` got
+   rejected even though the button also had a `pathUSD` method it could
+   have used. `resolve_payment_plan` now takes `preferred_tokens` (the
+   agent's own `allowed_tokens`) and picks a matching method when one
+   exists, case-insensitively — and when the same preferred token exists
+   on more than one network (e.g. `pathUSD` on both testnet and
+   mainnet), `preferred_network_hint` (derived from the agent's own
+   configured chain) breaks the tie, since `ButtonPayoutMethod` carries
+   no chain id to match on directly, only a network slug string.
+   Falls back to the first method only when nothing matches. This
+   preference is then **enforced, not just hoped for**: after resolving
+   a method, `pay_via_pay_button` checks it against this specific
+   token's own configured chain (from the agent's `payout_tokens`) and
+   rejects outright on a mismatch — it will never actually settle a
+   payment on a network this agent isn't configured to use that token
+   on, even if no better-matching method existed on the button at all.
+   An explicit `network` is trusted as the caller's own deliberate
+   choice and skips every part of this.
 
 Implemented (`agent/adapters/pay_button.py`), reusing AP2's settlement
 primitives directly (import, not duplication — see section 8, item 8).
