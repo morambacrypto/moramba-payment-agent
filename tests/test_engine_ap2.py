@@ -143,6 +143,7 @@ def test_pay_via_ap2_settles_end_to_end(tmp_path):
     assert record.tx_hash == "0xfinaltx"
     assert record.amount == Decimal("5.00")
     assert record.recipient == "button-1"
+    assert record.chain_id == 42431  # from the payin init response, not assumed
 
 
 @respx.mock
@@ -209,6 +210,7 @@ def test_pay_via_ap2_treats_already_completed_session_as_success(tmp_path):
     assert record.tx_hash == "0xfinaltx"
     assert record.amount == Decimal("5.00")
     assert record.recipient == "button-1"
+    assert record.chain_id == 42431  # from the payin init response, not assumed
 
 
 @respx.mock
@@ -285,3 +287,4 @@ def test_pay_via_ap2_converts_crypto_denominated_amount_using_sessions_own_decim
     assert record.status == STATUS_SETTLED
     assert record.tx_hash == "0xcoffeetx"
     assert record.amount == Decimal("1.5")
+    assert record.chain_id == 42431
