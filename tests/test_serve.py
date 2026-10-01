@@ -226,3 +226,60 @@ def test_main_respects_host_env_var(tmp_path, monkeypatch):
         serve.main()
 
     mock_run.assert_called_once_with("agent.api:app", host="0.0.0.0", port=8080)
+
+
+def test_main_defaults_to_plain_http_without_ssl_kwargs(tmp_path, monkeypatch):
+    monkeypatch.delenv("SSL", raising=False)
+    monkeypatch.setenv("PORT", "9999")
+    monkeypatch.chdir(tmp_path)
+    with patch.object(serve, "_resolve_port", return_value=9999), \
+         patch.object(serve, "_ensure_self_signed_cert") as mock_ensure_cert, \
+         patch.object(serve.uvicorn, "run") as mock_run:
+        serve.main()
+
+    mock_ensure_cert.assert_not_called()
+    mock_run.assert_called_once_with("agent.api:app", host="127.0.0.1", port=9999)
+
+
+def test_main_serves_https_when_ssl_env_var_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSL", "1")
+    monkeypatch.setenv("PORT", "9999")
+    monkeypatch.chdir(tmp_path)
+    with patch.object(serve, "_resolve_port", return_value=9999), \
+         patch.object(serve, "_ensure_self_signed_cert") as mock_ensure_cert, \
+         patch.object(serve.uvicorn, "run") as mock_run:
+        serve.main()
+
+    mock_ensure_cert.assert_called_once_with(serve._CERT_FILE, serve._KEY_FILE)
+    mock_run.assert_called_once_with(
+        "agent.api:app", host="127.0.0.1", port=9999,
+        ssl_certfile=serve._CERT_FILE, ssl_keyfile=serve._KEY_FILE,
+    )
+
+
+def test_ensure_self_signed_cert_generates_a_loadable_cert(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cert_path, key_path = "cert.pem", "key.pem"
+
+    serve._ensure_self_signed_cert(cert_path, key_path)
+
+    assert (tmp_path / cert_path).exists()
+    assert (tmp_path / key_path).exists()
+    assert oct((tmp_path / key_path).stat().st_mode)[-3:] == "600"
+
+    import ssl as ssl_module
+    ctx = ssl_module.SSLContext(ssl_module.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert_path, key_path)  # must not raise
+
+
+def test_ensure_self_signed_cert_does_not_regenerate_when_already_present(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cert_path, key_path = "cert.pem", "key.pem"
+
+    serve._ensure_self_signed_cert(cert_path, key_path)
+    first_cert_bytes = (tmp_path / cert_path).read_bytes()
+
+    serve._ensure_self_signed_cert(cert_path, key_path)
+    second_cert_bytes = (tmp_path / cert_path).read_bytes()
+
+    assert first_cert_bytes == second_cert_bytes

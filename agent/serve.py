@@ -17,18 +17,33 @@ else entirely, it's never touched: the pinned-port case then fails
 loudly (an explicit port request should mean that port, not a silent
 substitute), and the preferred-port case falls back to an OS-assigned
 free port instead.
+
+Set `SSL=1` to serve over HTTPS instead of plain HTTP — needed because
+Claude's web app (unlike Claude Code) only accepts an `https://` URL for
+a remote MCP server, even a local one. A self-signed cert for
+127.0.0.1/localhost is generated once and cached (_CERT_FILE/_KEY_FILE),
+not regenerated on every start, since a browser that already trusted a
+previous cert would otherwise need to re-trust a new one each restart.
+It's opt-in, not the default, because a self-signed cert is untrusted by
+default — the browser/client will warn the first time, and nothing
+about this makes 127.0.0.1 reachable from outside this machine.
 """
 
+import ipaddress
 import os
 import signal
 import socket
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import uvicorn
 
 _DEFAULT_HOST = "127.0.0.1"
 _PREFERRED_PORT = 58417
 _PID_FILE = ".moramba_payment_agent.pid"
+_CERT_FILE = ".moramba_payment_agent_cert.pem"
+_KEY_FILE = ".moramba_payment_agent_key.pem"
 _STOP_TIMEOUT_SECONDS = 5.0
 
 
@@ -118,9 +133,55 @@ def _resolve_port(host: str, port: int) -> int | None:
     return port if _is_port_free(host, port) else None
 
 
+def _ensure_self_signed_cert(cert_path: str, key_path: str) -> None:
+    """Generates a self-signed TLS cert/key for 127.0.0.1/localhost if
+    one doesn't already exist, so SSL=1 needs neither an external
+    `openssl` call nor a cert the user has to supply themselves. Cached
+    on disk rather than regenerated every start — see the module
+    docstring for why that matters."""
+    if Path(cert_path).exists() and Path(key_path).exists():
+        return
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+            ),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+
+    Path(key_path).write_bytes(
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    Path(cert_path).write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    os.chmod(key_path, 0o600)
+
+
 def main() -> None:
     host = os.environ.get("HOST", _DEFAULT_HOST)
     pinned_port = os.environ.get("PORT")
+    ssl_enabled = os.environ.get("SSL", "").lower() in ("1", "true", "yes")
 
     if pinned_port:
         requested = int(pinned_port)
@@ -133,11 +194,24 @@ def main() -> None:
             port = find_free_port(host)
 
     _write_pid_file()
-    print(f"Starting moramba-payment-agent on http://{host}:{port}")
+
+    ssl_kwargs = {}
+    scheme = "http"
+    if ssl_enabled:
+        _ensure_self_signed_cert(_CERT_FILE, _KEY_FILE)
+        ssl_kwargs = {"ssl_certfile": _CERT_FILE, "ssl_keyfile": _KEY_FILE}
+        scheme = "https"
+
+    print(f"Starting moramba-payment-agent on {scheme}://{host}:{port}")
+    if ssl_enabled:
+        print(
+            f"(self-signed cert — your browser/client will warn it's untrusted the first "
+            f"time; accept it once, or trust {_CERT_FILE} in your OS/browser store)"
+        )
     if not pinned_port:
         print(f"(tried preferred port {_PREFERRED_PORT} first, auto-selected otherwise — set PORT to pin a specific one instead)")
 
-    uvicorn.run("agent.api:app", host=host, port=port)
+    uvicorn.run("agent.api:app", host=host, port=port, **ssl_kwargs)
 
 
 if __name__ == "__main__":

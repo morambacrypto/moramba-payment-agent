@@ -5,7 +5,7 @@ x402, AP2 (Autonomous), Moramba Pay Button, Agent Transfer (pay any
 Moramba agent directly by id), and Payin (pay an existing payin_id
 directly) — plus the local ledger, the live limit check, a FastAPI
 service wrapper, the setup wizard, and the MCP tool server, all with a
-passing test suite (167 tests). Packaged as a proper
+passing test suite (171 tests). Packaged as a proper
 pip-installable project (`pyproject.toml`) so a partner can
 `pip install -e .` instead of running from source on `PYTHONPATH`; Docker
 packaging was dropped — not needed for this project. The setup wizard now
@@ -36,7 +36,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 167 tests, all passing
+python -m pytest -q          # 171 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -108,7 +108,15 @@ local development. Set `AGENT_THREAD_POOL_SIZE` to raise how many
 payments can be in flight at once — every route is sync, since each
 rail makes blocking httpx/web3 calls, so concurrency comes from a
 thread pool rather than asyncio; the default is 100, well above
-anyio's own default of 40.)
+anyio's own default of 40. Set `SSL=1` to serve over HTTPS instead of
+plain HTTP — Claude's web app (unlike Claude Code) only accepts an
+`https://` URL for a remote MCP server, even a local one. A self-signed
+cert for `127.0.0.1`/`localhost` is generated once and cached
+(`.moramba_payment_agent_cert.pem`/`_key.pem`, not regenerated on every
+start) rather than requiring an external `openssl` call or a cert the
+partner has to supply. It's opt-in, not the default, since a self-signed
+cert is untrusted by any browser/client until accepted once — nothing
+about this makes `127.0.0.1` reachable from outside this machine.)
 
 ```
 curl -X POST localhost:PORT/payment-agent-api/pay/mpp -H "Content-Type: application/json" -d '{
