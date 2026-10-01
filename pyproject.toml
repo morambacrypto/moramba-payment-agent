@@ -36,6 +36,8 @@ dev = [
 moramba-payment-agent-setup = "agent.setup:main"
 moramba-payment-agent-mcp = "agent.mcp_server:main"
 moramba-payment-agent-serve = "agent.serve:main"
+moramba-payment-agent-show-key = "agent.setup:show_key"
+moramba-payment-agent-rotate-key = "agent.setup:rotate_key"
 
 [tool.setuptools]
 packages = ["agent", "agent.adapters"]
