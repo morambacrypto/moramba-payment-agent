@@ -23,7 +23,6 @@ from decimal import Decimal, InvalidOperation
 from anyio import to_thread
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from pydantic import BaseModel
-from starlette.routing import Mount
 
 from agent import mcp_server
 from agent.config import Settings
@@ -44,12 +43,26 @@ _agent: Agent | None = None
 # handlers.
 _DEFAULT_THREAD_POOL_SIZE = 100
 
-# `Mount.app` is reassigned fresh on every lifespan start (see `lifespan`
-# below) rather than built once here — a `StreamableHTTPSessionManager`
-# can only be `.run()` once per instance, so the same app object can't
+# Built with streamable_http_path="/mcp" (an absolute path) rather than
+# mounted via `Mount("/mcp", ...)` on a sub-app rooted at "/": a `Mount`
+# only matches a bare "/mcp" (no trailing slash) by 307-redirecting to
+# "/mcp/" first, and that redirect's Location echoes back whatever Host
+# header the request arrived with. Through a reverse proxy that
+# preserves the original Host (e.g. `cloudflared tunnel --url`, unless
+# told to pin it — see agent/serve.py), or one that rewrites it to this
+# process's own address, that redirect can point a remote client at a
+# URL it can't reach at all — found live (2026-10-01) via Claude's web
+# app over a Cloudflare quick tunnel. Building the route at the exact
+# absolute path instead means "/mcp" (no slash) matches directly, no
+# redirect involved.
+#
+# `_current_mcp_routes` tracks whichever route objects are currently
+# installed in `app.router.routes` so `lifespan` (below) can remove and
+# replace them on every start — a `StreamableHTTPSessionManager` can
+# only be `.run()` once per instance, so the same route objects can't
 # survive a second startup (a real process only starts once, but the
 # test suite starts/stops this same `app` many times).
-_mcp_mount = Mount("/mcp", app=mcp_server.mcp.streamable_http_app(streamable_http_path="/"))
+_current_mcp_routes: list = []
 
 
 @asynccontextmanager
@@ -57,8 +70,11 @@ async def lifespan(app: FastAPI):
     global _agent
     pool_size = int(os.environ.get("AGENT_THREAD_POOL_SIZE", _DEFAULT_THREAD_POOL_SIZE))
     to_thread.current_default_thread_limiter().total_tokens = pool_size
-    mcp_app = mcp_server.mcp.streamable_http_app(streamable_http_path="/")
-    _mcp_mount.app = mcp_app
+    mcp_app = mcp_server.mcp.streamable_http_app(streamable_http_path="/mcp")
+    for old_route in _current_mcp_routes:
+        app.router.routes.remove(old_route)
+    _current_mcp_routes[:] = mcp_app.routes
+    app.router.routes.extend(_current_mcp_routes)
     async with AsyncExitStack() as stack:
         # The MCP session manager's own lifespan isn't run automatically
         # just because its app is mounted — Starlette doesn't cascade
@@ -271,4 +287,3 @@ def list_payments(
 
 
 app.include_router(router)
-app.router.routes.append(_mcp_mount)

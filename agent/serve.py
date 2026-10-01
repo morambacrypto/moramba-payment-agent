@@ -157,7 +157,7 @@ def _watch_tunnel_output(process: subprocess.Popen) -> None:
     for line in process.stdout:
         match = _TRYCLOUDFLARE_URL_RE.search(line)
         if match:
-            print(f"Public URL (Cloudflare quick tunnel, for Claude's web app): {match.group(0)}")
+            print(f"MCP URL (for Claude's web app, via Cloudflare quick tunnel): {match.group(0)}/mcp")
             return
 
 
@@ -235,7 +235,19 @@ def _start_quick_tunnel(host: str, port: int) -> subprocess.Popen | None:
     server — see the module docstring for why this is what Claude's web
     app actually needs. Returns `None` without raising if cloudflared
     isn't available and couldn't be downloaded, since the local service
-    is still fully usable (for Claude Code) either way."""
+    is still fully usable (for Claude Code) either way.
+
+    `--http-host-header` pins the Host header cloudflared presents to
+    this origin to `host:port`, same as a direct local request — without
+    it, cloudflared forwards the public `*.trycloudflare.com` hostname
+    unchanged, which the MCP mount's DNS-rebinding protection (enabled
+    for a 127.0.0.1/localhost host, see agent/api.py) then rejects with
+    421 Misdirected Request, since that hostname isn't 127.0.0.1/
+    localhost/[::1] — found live (2026-10-01) exactly this way. Pinning
+    the header is correct here, not a workaround: the DNS-rebinding
+    check exists to confirm a request actually reached this server via
+    an address it recognizes as itself, which `host:port` still
+    genuinely is after cloudflared forwards it."""
     cloudflared_path = _resolve_cloudflared_path()
     if cloudflared_path is None:
         print(
@@ -248,7 +260,10 @@ def _start_quick_tunnel(host: str, port: int) -> subprocess.Popen | None:
 
     try:
         process = subprocess.Popen(
-            [cloudflared_path, "tunnel", "--url", f"http://{host}:{port}"],
+            [
+                cloudflared_path, "tunnel", "--url", f"http://{host}:{port}",
+                "--http-host-header", f"{host}:{port}",
+            ],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
     except OSError as exc:
@@ -277,6 +292,7 @@ def main() -> None:
     _write_pid_file()
 
     print(f"Starting moramba-payment-agent on http://{host}:{port}")
+    print(f"MCP URL (for Claude Code / Claude Desktop): http://{host}:{port}/mcp")
     if not pinned_port:
         print(f"(tried preferred port {_PREFERRED_PORT} first, auto-selected otherwise — set PORT to pin a specific one instead)")
 
