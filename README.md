@@ -100,35 +100,62 @@ second one next to it: if `58417` turns out to be held by a previous
 file written on every start), that old process is stopped first so the
 new one can take the port over. A pid that isn't this tool's own (or has
 already exited) is never touched — the port is left alone and the usual
-fallback applies instead. Prints something like
-`Starting moramba-payment-agent on http://127.0.0.1:58417`; set
-`PORT`/`HOST` env vars to pin a specific address instead, or use
+fallback applies instead. Prints the MCP URL to use directly, e.g.
+`MCP URL (for Claude Code / Claude Desktop): http://127.0.0.1:58417/mcp`;
+set `PORT`/`HOST` env vars to pin a specific address instead, or use
 `uvicorn agent.api:app --reload` directly if you want `--reload` for
 local development. Set `AGENT_THREAD_POOL_SIZE` to raise how many
 payments can be in flight at once — every route is sync, since each
 rail makes blocking httpx/web3 calls, so concurrency comes from a
 thread pool rather than asyncio; the default is 100, well above
-anyio's own default of 40. Claude's web app's MCP connector calls out
-from Anthropic's own servers, not the browser, so `localhost`/
-`127.0.0.1` can never reach it — "our servers cannot reach your local
-machine" is Claude's own error for this, and no amount of local TLS
-changes that (Claude Code has no such restriction and already works
-against the plain `http://` URL above). Set `TUNNEL=1` to expose this
-server through a free Cloudflare quick tunnel: no account, no domain, no
-signup, a public `https://*.trycloudflare.com` URL within seconds,
-printed to the console once the tunnel connects, with Cloudflare's own
-real, trusted certificate. No manual install step either — if
-`cloudflared` isn't already on PATH, the right binary for this
-platform/architecture is downloaded once from its official GitHub
-releases and cached under `~/.cache/moramba-payment-agent/` (not
-re-fetched on later runs); only falls back to printing manual install
-instructions (and still serves locally, same as Claude Code needs) if
-there's no prebuilt release for this platform or the download itself
-fails. Live-tested end to end (2026-10-01), including the auto-download
-path with no `cloudflared` pre-installed: a request to the public URL
-reached this local server correctly. The trade-off is the URL is random
-and changes every restart — fine for testing from Claude's web app, not
-a stable, permanent address.)
+anyio's own default of 40.
+
+Claude's web app's MCP connector calls out from Anthropic's own
+servers, not the browser, so `localhost`/`127.0.0.1` can never reach it
+— "our servers cannot reach your local machine" is Claude's own error
+for this, and no amount of local TLS changes that (Claude Code has no
+such restriction and already works against the plain `http://` URL
+above). Set `TUNNEL=1` to expose this server through a free Cloudflare
+quick tunnel: no account, no domain, no signup, a public
+`https://*.trycloudflare.com/mcp` URL within seconds, printed to the
+console once the tunnel connects (`MCP URL (for Claude's web app, via
+Cloudflare quick tunnel): ...`), with Cloudflare's own real, trusted
+certificate. No manual install step either — if `cloudflared` isn't
+already on PATH, the right binary for this platform/architecture is
+downloaded once from its official GitHub releases and cached under
+`~/.cache/moramba-payment-agent/` (not re-fetched on later runs); only
+falls back to printing manual install instructions (and still serves
+locally, same as Claude Code needs) if there's no prebuilt release for
+this platform or the download itself fails. The trade-off is the URL is
+random and changes every restart — fine for testing from Claude's web
+app, not a stable, permanent address.
+
+Two real bugs found getting this working end to end against Claude's
+web app, not just read from source (2026-10-01):
+
+1. **`cloudflared tunnel --url` forwards the original public hostname
+   as the `Host` header by default**, which the MCP mount's
+   DNS-rebinding protection (auto-enabled for a 127.0.0.1/localhost
+   host — see `agent/api.py`) then rejected with
+   `421 Misdirected Request`, since `*.trycloudflare.com` isn't
+   127.0.0.1/localhost/`[::1]`. Fixed with `--http-host-header
+   127.0.0.1:<port>`, pinning the Host header cloudflared presents to
+   this origin — not a workaround, since that's genuinely still this
+   server's own address after forwarding.
+2. **A bare `/mcp` request 307-redirected to `/mcp/`**, and that
+   redirect's `Location` echoed back whatever `Host` header the request
+   arrived with — after the fix above, that became
+   `https://127.0.0.1:<port>/mcp/`, unreachable for a remote client.
+   Root cause: the MCP app was mounted as a `Mount("/mcp", app=...)`
+   wrapping a sub-app rooted at `/`, and a bare prefix match without the
+   trailing slash always redirects. Fixed by building the MCP app with
+   its route at the exact absolute path `/mcp` instead
+   (`streamable_http_app(streamable_http_path="/mcp")`) and installing
+   that route directly, with no `Mount` and no redirect involved at all.
+
+Live-tested end to end against a real request through the public tunnel
+(initialize handshake, `200 OK`, no redirect) — including the
+auto-download path with no `cloudflared` pre-installed.)
 
 ```
 curl -X POST localhost:PORT/payment-agent-api/pay/mpp -H "Content-Type: application/json" -d '{

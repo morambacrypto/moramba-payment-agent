@@ -164,7 +164,7 @@ def test_stop_previous_instance_gives_up_quietly_if_process_already_gone(monkeyp
     serve._stop_previous_instance(4242, "127.0.0.1", 58417)  # must not raise
 
 
-def test_main_uses_preferred_port_when_resolve_succeeds(tmp_path, monkeypatch):
+def test_main_uses_preferred_port_when_resolve_succeeds(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("PORT", raising=False)
     monkeypatch.chdir(tmp_path)
     with patch.object(serve, "_resolve_port", return_value=serve._PREFERRED_PORT) as mock_resolve, \
@@ -176,6 +176,7 @@ def test_main_uses_preferred_port_when_resolve_succeeds(tmp_path, monkeypatch):
     mock_find.assert_not_called()
     mock_run.assert_called_once_with("agent.api:app", host="127.0.0.1", port=serve._PREFERRED_PORT)
     assert (tmp_path / serve._PID_FILE).read_text() == str(os.getpid())
+    assert f"http://127.0.0.1:{serve._PREFERRED_PORT}/mcp" in capsys.readouterr().out
 
 
 def test_main_falls_back_to_a_free_port_when_preferred_port_resolve_fails(tmp_path, monkeypatch):
@@ -240,7 +241,7 @@ def test_watch_tunnel_output_prints_the_trycloudflare_url(capsys):
 
     serve._watch_tunnel_output(fake_process)
 
-    assert "https://random-words-here.trycloudflare.com" in capsys.readouterr().out
+    assert "https://random-words-here.trycloudflare.com/mcp" in capsys.readouterr().out
 
 
 def test_watch_tunnel_output_returns_quietly_when_no_url_appears(capsys):
@@ -279,7 +280,10 @@ def test_start_quick_tunnel_launches_the_resolved_cloudflared_with_the_right_url
 
     assert result is fake_process
     mock_popen.assert_called_once_with(
-        ["/path/to/cloudflared", "tunnel", "--url", "http://127.0.0.1:58417"],
+        [
+            "/path/to/cloudflared", "tunnel", "--url", "http://127.0.0.1:58417",
+            "--http-host-header", "127.0.0.1:58417",
+        ],
         stdout=serve.subprocess.PIPE, stderr=serve.subprocess.STDOUT, text=True, bufsize=1,
     )
     mock_thread.assert_called_once()
