@@ -4,7 +4,7 @@
 x402, AP2 (Autonomous), Moramba Pay Button, and Agent Transfer (pay any
 Moramba agent directly by id) — plus the local ledger, the live limit
 check, a FastAPI service wrapper, the setup wizard, and the MCP tool
-server, all with a passing test suite (132 tests). Packaged as a proper
+server, all with a passing test suite (138 tests). Packaged as a proper
 pip-installable project (`pyproject.toml`) so a partner can
 `pip install -e .` instead of running from source on `PYTHONPATH`; Docker
 packaging was dropped — not needed for this project. The setup wizard now
@@ -34,7 +34,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 132 tests, all passing
+python -m pytest -q          # 138 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -402,6 +402,18 @@ real flow below was verified live against a running local server
    on, even if no better-matching method existed on the button at all.
    An explicit `network` is trusted as the caller's own deliberate
    choice and skips every part of this.
+7. **A variable-amount button's `amount` must be sent in minor units,
+   not human units.** Found live (2026-10-01): paying "1 pathUSD" on a
+   variable-amount button settled `0.000001` pathUSD on-chain instead.
+   Root cause confirmed from the backend
+   (`create_ai_payin_user_by_button_id_controller` in
+   `payin_user_controller.rs`): for a variable button, the request's
+   `amount` is stored as the payin's `base_amount` completely unscaled —
+   the exact same way a *fixed* button's own `amount_with_decimal` field
+   (already minor units, e.g. `"1000000"`) is used. `pay_button()` now
+   multiplies the human-unit amount by `10 ** decimals` before sending
+   it, the inverse of the division `resolve_payment_plan` already does
+   to convert a fixed button's `amount_with_decimal` the other way.
 
 Implemented (`agent/adapters/pay_button.py`), reusing AP2's settlement
 primitives directly (import, not duplication — see section 8, item 8).
@@ -481,6 +493,18 @@ For that case, `transfer_erc20` also takes an explicit `gas_limit`
 override — meant to be set only after a failed attempt's error names
 the actual gas needed, and only with a human's go-ahead (an AI agent
 calling this as a tool should ask before raising it, not decide alone).
+
+Before building or signing anything, both balances this transfer
+actually needs are checked: the token balance (`balanceOf`, against the
+amount being sent) and the native balance (against the resolved gas
+limit × gas price). Either coming up short rejects the payment with a
+clear reason (`"insufficient token balance: have X, need Y"` /
+`"insufficient native balance for gas: ..."`) instead of broadcasting a
+transaction that would revert on-chain — a revert still costs the gas
+already spent getting it mined, so checking first is strictly cheaper,
+not just a nicer error message. This rail shares its on-chain sending
+code (`agent/adapters/erc20.py`) with `pay_agent`, so the same checks
+apply there too.
 
 ### Network
 **Tempo testnet (chain id 42431) first.** Mainnet and other chains are a

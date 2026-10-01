@@ -220,6 +220,41 @@ def test_resolve_payment_plan_falls_back_when_network_hint_matches_nothing():
     assert plan.method.network == "tempo_mainnet"  # no method's network contains "devnet" — first match stands
 
 
+VARIABLE_MULTI_TOKEN_BUTTON_METHODS_RESPONSE = {
+    "success": True, "message": "button payment methods fetched",
+    "data": {
+        "button_id": "variable-multi-button-id", "fixed_amount": False,
+        "methods": [
+            {
+                "payout_destination_id": "usdc-method", "network": "tempo_testnet", "token_name": "usdc",
+                "token_address": "0x" + "aa" * 20, "to_wallet_address": "0x" + "11" * 20,
+                "decimals": 6, "amount_with_decimal": None, "is_default": True,
+            },
+            {
+                "payout_destination_id": "pathusd-method", "network": "tempo_testnet", "token_name": "pathUSD",
+                "token_address": "0x20c0000000000000000000000000000000000000",
+                "to_wallet_address": "0x6784f65225f7d567cf1535525b0dd720b1450d1b",
+                "decimals": 6, "amount_with_decimal": None, "is_default": False,
+            },
+        ],
+    },
+}
+
+
+@respx.mock
+def test_resolve_payment_plan_token_preference_also_applies_to_variable_amount_buttons():
+    """Method selection runs before the fixed/variable-amount branch, so
+    a variable-amount multi-token button gets the same preferred-token
+    treatment as a fixed-amount one — this pins that down explicitly."""
+    _mock_methods("variable-multi-button-id", VARIABLE_MULTI_TOKEN_BUTTON_METHODS_RESPONSE)
+    plan = pay_button.resolve_payment_plan(
+        BASE_URL, "variable-multi-button-id", amount=Decimal("3"), preferred_tokens=["pathUSD"]
+    )
+    assert plan.method.token_name == "pathUSD"
+    assert plan.fixed_amount is False
+    assert plan.amount == Decimal("3")
+
+
 @respx.mock
 def test_create_payin_by_button_id_sends_expected_body_and_omits_amount_when_none():
     route = respx.post(f"{BASE_URL}/api/v2/morambacrypto/public/payin/create/by/button_id/{BUTTON_ID}").mock(
@@ -232,6 +267,58 @@ def test_create_payin_by_button_id_sends_expected_body_and_omits_amount_when_non
     assert result["id"] == "payin-1"
     body = json.loads(route.calls[0].request.content)
     assert body == {"network": "tempo_testnet", "token_address": "0x20c0000000000000000000000000000000000000"}
+
+
+@respx.mock
+def test_pay_button_converts_variable_amount_to_minor_units_for_create_payin():
+    """Regression test for a real live bug: sending "1" (human units) for
+    a 1-pathUSD variable-amount payment settled 0.000001 pathUSD on-chain.
+    The backend treats a variable button's `amount` the same way it
+    treats a fixed button's own `amount_with_decimal` — already in minor
+    units, not human units — so the client must scale it before sending,
+    the same way `amount_with_decimal` is scaled back on the way in."""
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    route = respx.post(f"{BASE_URL}/api/v2/morambacrypto/public/payin/create/by/button_id/{BUTTON_ID}").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"id": "payin-var-amt-1"}})
+    )
+    respx.get(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/init/payin-var-amt-1/address/{wallet.address}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "message": "ok",
+                "data": {
+                    "token_address": "0x20c0000000000000000000000000000000000000", "token_name": "pathusd",
+                    "amount": "1000000", "chain_id": 42431, "rpc": "https://rpc.moderato.tempo.xyz",
+                    "verify_sc_address": "0x" + "33" * 20, "to": "0x6784f65225f7d567cf1535525b0dd720b1450d1b",
+                    "transaction_id": "tx-var-amt-1", "nonce": "0",
+                },
+            },
+        )
+    )
+    respx.post(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/pay/payin-var-amt-1/tnxid/tx-var-amt-1/relay").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"accepted": True}})
+    )
+    respx.get(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/status/tnxid/tx-var-amt-1").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"status": "success", "tx_hash": "0xvaramttx"}})
+    )
+
+    plan = pay_button.ButtonPaymentPlan(
+        method=pay_button.ButtonPayoutMethod(
+            payout_destination_id="payout-1", network="tempo_testnet", token_name="pathusd",
+            token_address="0x20c0000000000000000000000000000000000000",
+            to_wallet_address="0x6784f65225f7d567cf1535525b0dd720b1450d1b", decimals=6, amount_with_decimal=None,
+        ),
+        amount=Decimal("1"), fixed_amount=False,
+    )
+
+    stub_body = {"from": wallet.address, "to": plan.method.to_wallet_address, "signature": "0xsig"}
+    with patch.object(pay_button, "detect_flow", return_value="plain"), \
+         patch.dict(pay_button._BUILDER_BY_FLOW, {"plain": lambda w3, account, init: stub_body}):
+        result = pay_button.pay_button(BASE_URL, BUTTON_ID, plan, wallet)
+
+    assert result.success
+    body = json.loads(route.calls[0].request.content)
+    assert body["amount"] == "1000000"  # 1 pathUSD at 6 decimals, in minor units
 
 
 @respx.mock

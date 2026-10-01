@@ -262,3 +262,74 @@ def test_pay_via_pay_button_rejects_when_resolved_method_is_on_the_wrong_network
     assert "tempo_mainnet" in record.reason
     assert "chain 42431" in record.reason
     mock_pay.assert_not_called()
+
+
+@respx.mock
+def test_pay_via_pay_button_picks_matching_method_on_a_variable_amount_button(tmp_path):
+    """Same preferred-token selection as the fixed-amount case, on a
+    variable-amount button — selection runs before the fixed/variable
+    branch, so this is the same code path with a caller-supplied amount."""
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "pathUSD"}])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+
+    variable_multi_token_response = {
+        "success": True, "message": "button payment methods fetched",
+        "data": {
+            "button_id": BUTTON_ID, "fixed_amount": False,
+            "methods": [
+                {
+                    "payout_destination_id": "usdc-method", "network": "tempo_testnet", "token_name": "usdc",
+                    "token_address": "0x" + "aa" * 20, "to_wallet_address": "0x" + "11" * 20,
+                    "decimals": 6, "amount_with_decimal": None, "is_default": True,
+                },
+                {
+                    "payout_destination_id": "pathusd-method", "network": "tempo_testnet", "token_name": "pathUSD",
+                    "token_address": "0x20c0000000000000000000000000000000000000",
+                    "to_wallet_address": "0x6784f65225f7d567cf1535525b0dd720b1450d1b",
+                    "decimals": 6, "amount_with_decimal": None, "is_default": False,
+                },
+            ],
+        },
+    }
+    mock_button_methods(BUTTON_ID, variable_multi_token_response)
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/payin/create/by/button_id/{BUTTON_ID}").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"id": "payin-var-1"}})
+    )
+    respx.get(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/payrequest/init/payin-var-1/address/{wallet.address}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "message": "ok",
+                "data": {
+                    "token_address": "0x20c0000000000000000000000000000000000000", "token_name": "pathUSD",
+                    "amount": "3000000", "chain_id": 42431, "rpc": "https://rpc.moderato.tempo.xyz",
+                    "verify_sc_address": "0x" + "33" * 20, "to": "0x6784f65225f7d567cf1535525b0dd720b1450d1b",
+                    "transaction_id": "tx-var-1", "nonce": "0",
+                },
+            },
+        )
+    )
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/payrequest/pay/payin-var-1/tnxid/tx-var-1/relay").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"accepted": True}})
+    )
+    respx.get(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/payrequest/status/tnxid/tx-var-1").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"status": "success", "tx_hash": "0xvartx"}})
+    )
+
+    stub_body = {"from": wallet.address, "to": "0x6784f65225f7d567cf1535525b0dd720b1450d1b", "signature": "0xsig"}
+    with patch.object(pay_button, "detect_flow", return_value="plain"), \
+         patch.dict(pay_button._BUILDER_BY_FLOW, {"plain": lambda w3, account, init: stub_body}):
+        agent = Agent(settings)
+        try:
+            record = agent.pay_via_pay_button(button_id=BUTTON_ID, amount=Decimal("3"))
+        finally:
+            agent.close()
+
+    assert record.status == STATUS_SETTLED
+    assert record.token == "pathUSD"
+    assert record.recipient == "0x6784f65225f7d567cf1535525b0dd720b1450d1b"
+    assert record.amount == Decimal("3")
