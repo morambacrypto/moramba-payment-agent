@@ -4,7 +4,7 @@
 x402, AP2 (Autonomous), Moramba Pay Button, and Agent Transfer (pay any
 Moramba agent directly by id) — plus the local ledger, the live limit
 check, a FastAPI service wrapper, the setup wizard, and the MCP tool
-server, all with a passing test suite (138 tests). Packaged as a proper
+server, all with a passing test suite (156 tests). Packaged as a proper
 pip-installable project (`pyproject.toml`) so a partner can
 `pip install -e .` instead of running from source on `PYTHONPATH`; Docker
 packaging was dropped — not needed for this project. The setup wizard now
@@ -12,7 +12,8 @@ auto-detects the agent's network (chain/RPC) from its own Moramba config,
 always enables every rail (nothing to choose), and requires every
 remaining answer explicitly — no field is silently defaulted or
 skippable. Running the FastAPI service no longer requires a free port to
-guess at either: `moramba-payment-agent-serve` auto-selects one.
+guess at either: `moramba-payment-agent-serve` tries a fixed preferred
+port first and falls back to an auto-selected one if that's taken.
 The Pay Button rail settled a real payment live, end-to-end, on Tempo
 testnet against production (2026-09-29,
 [tx 0x43d1d64f...](https://explore.testnet.tempo.xyz/tx/0x43d1d64fa09f1db9710b780d5382e4d10f5c4762718047285470c57e9aa34194)) —
@@ -34,7 +35,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 138 tests, all passing
+python -m pytest -q          # 156 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -85,11 +86,22 @@ As an HTTP service, which also serves the MCP tool server on the same
 port (section 6, "Surfaces"):
 
 ```
-moramba-payment-agent-serve   # auto-picks a free port and prints it — no port conflict to debug
+moramba-payment-agent-serve   # tries port 58417 first, falls back to a free one if that's taken
 ```
 
-(prints something like `Starting moramba-payment-agent on http://127.0.0.1:54321`;
-set `PORT`/`HOST` env vars to pin a specific address instead, or use
+(tries `58417` first — an IANA dynamic/private-range port chosen
+specifically because no well-known software defaults there, so it's
+unlikely to already be in use; falls back to an OS-assigned free port
+only if `58417` itself is taken by something else. Running the command
+again is meant to *replace* an already-running instance, not start a
+second one next to it: if `58417` turns out to be held by a previous
+`moramba-payment-agent-serve` run (tracked via a `.moramba_payment_agent.pid`
+file written on every start), that old process is stopped first so the
+new one can take the port over. A pid that isn't this tool's own (or has
+already exited) is never touched — the port is left alone and the usual
+fallback applies instead. Prints something like
+`Starting moramba-payment-agent on http://127.0.0.1:58417`; set
+`PORT`/`HOST` env vars to pin a specific address instead, or use
 `uvicorn agent.api:app --reload` directly if you want `--reload` for
 local development. Set `AGENT_THREAD_POOL_SIZE` to raise how many
 payments can be in flight at once — every route is sync, since each
