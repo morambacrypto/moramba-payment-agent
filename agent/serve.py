@@ -58,6 +58,8 @@ from pathlib import Path
 
 import uvicorn
 
+from agent.setup import ensure_payment_agent_api_key
+
 _DEFAULT_HOST = "127.0.0.1"
 _PREFERRED_PORT = 58417
 _PID_FILE = ".moramba_payment_agent.pid"
@@ -293,6 +295,11 @@ def main() -> None:
 
     print(f"Starting moramba-payment-agent on http://{host}:{port}")
     print(f"MCP URL (for Claude Code / Claude Desktop): http://{host}:{port}/mcp")
+    if Path(".env").exists():
+        # Same persisted value agent/api.py's lifespan will load (generated
+        # here first if .env predates the field), so what's printed is
+        # exactly what the service enforces.
+        print(f"PAYMENT_AGENT_API_KEY (send as header `Authorization: Bearer <key>`): {ensure_payment_agent_api_key()}")
     if not pinned_port:
         print(f"(tried preferred port {_PREFERRED_PORT} first, auto-selected otherwise — set PORT to pin a specific one instead)")
 
