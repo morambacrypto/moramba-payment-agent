@@ -5,7 +5,7 @@ x402, AP2 (Autonomous), Moramba Pay Button, Agent Transfer (pay any
 Moramba agent directly by id), and Payin (pay an existing payin_id
 directly) — plus the local ledger, the live limit check, a FastAPI
 service wrapper, the setup wizard, and the MCP tool server, all with a
-passing test suite (188 tests). Packaged as a proper
+passing test suite (191 tests). Packaged as a proper
 pip-installable project (`pyproject.toml`) so a partner can
 `pip install -e .` instead of running from source on `PYTHONPATH`; Docker
 packaging was dropped — not needed for this project. The setup wizard now
@@ -36,7 +36,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 188 tests, all passing
+python -m pytest -q          # 191 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -320,16 +320,28 @@ Two signing schemes are involved, and they're not interchangeable:
 Two-phase like x402: the checkout amount isn't known until
 `create_checkout_session` returns, so the limit check runs **between**
 session creation and the Closed Mandate signature — nothing is signed
-before it passes. Known limitation: the limit check only has the
-checkout's fiat currency (e.g. `"USD"`) to work with at that point, not
-the crypto token actually settled later — an `allowed_tokens` list keyed
-on crypto symbols won't match it (see `engine.py`'s `pay_via_ap2`
-docstring). Also known (documented server-side, not something this
-project can fix): Moramba's own `authorize_autonomous` only enforces
-`per_transaction_limit`/`maximum_payout_limit` live — daily/monthly/
-hourly/count limits for this endpoint are a stated v1 gap on the backend
-itself, same shape as the MPP/ERC20/x402 gap this project's local ledger
-already closes for those rails.
+before it passes. `session.currency` is the settlement token's own name
+(e.g. `"PATHUSD"`, uppercased — see `currency_for` in
+`acp_checkout_service.rs`), not a fiat code, so it's checked against
+`allowed_tokens` the same as every other rail.
+
+**Real bug found live (2026-10-02), not just read from source**: a
+real 1.5 pathUSD coffee purchase through a UCP demo shop was rejected as
+exceeding a $5 per-transaction limit. The recorded amount was `15000`
+instead of `1.5` — `session.amount` (`1,500,000`, pathUSD's own minor
+units at 6 decimals) was being divided by a hardcoded `100`, the
+fiat-cents convention the ACP spec documents for a real currency, which
+simply doesn't apply once the settlement token itself is the "currency."
+Fixed by reading `decimals` from the session's own `payment_options`
+(matched by `selected_payout_destination_id`, falling back to a name
+match, and only defaulting to `2` when a backend reports no
+`payment_options` at all — i.e. a genuinely fiat-denominated checkout)
+instead of assuming it. Also known (documented server-side, not
+something this project can fix): Moramba's own `authorize_autonomous`
+only enforces `per_transaction_limit`/`maximum_payout_limit` live —
+daily/monthly/hourly/count limits for this endpoint are a stated v1 gap
+on the backend itself, same shape as the MPP/ERC20/x402 gap this
+project's local ledger already closes for those rails.
 
 ### x402 — real spec, official SDK, not hand-rolled
 Two Moramba x402 deployments exist in this codebase family, and they

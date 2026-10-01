@@ -44,6 +44,59 @@ def test_create_checkout_session_parses_response():
     assert session.session_id == "sess-1"
     assert session.amount == "500"
     assert session.currency == "USD"
+    assert session.decimals == 2  # no payment_options in this response — fiat-cents fallback
+
+
+@respx.mock
+def test_create_checkout_session_resolves_decimals_from_selected_payment_option():
+    """Regression test for a real live bug (2026-10-02): a 1.5 pathUSD
+    checkout (1,500,000 minor units at 6 decimals) was divided by a
+    hardcoded 100 instead, turning it into 15,000 and triggering a false
+    spend-limit rejection for an otherwise ordinary coffee purchase.
+    `currency` is the settlement token's own name here, not fiat — see
+    `currency_for` in acp_checkout_service.rs — so decimals must come
+    from the session's own `payment_options`, not an assumption."""
+    option_id = "11111111-1111-1111-1111-111111111111"
+    respx.post(f"{BASE_URL}/acp/checkout_sessions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "sess-1", "currency": "PATHUSD", "totals": [{"amount": 1_500_000}],
+                "selected_payout_destination_id": option_id,
+                "payment_options": [
+                    {
+                        "payout_destination_id": option_id, "network": "tempo_testnet",
+                        "token": "pathusd", "token_address": "0x" + "20" * 20,
+                        "amount": 1_500_000, "decimals": 6, "is_default": True,
+                    }
+                ],
+            },
+        )
+    )
+    session = ap2.create_checkout_session(BASE_URL, API_KEY, [{"id": "button-1"}])
+    assert session.amount == "1500000"
+    assert session.decimals == 6
+
+
+@respx.mock
+def test_create_checkout_session_resolves_decimals_by_token_name_without_selected_id():
+    respx.post(f"{BASE_URL}/acp/checkout_sessions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "sess-1", "currency": "USDC", "totals": [{"amount": 2_500_000}],
+                "payment_options": [
+                    {
+                        "payout_destination_id": "22222222-2222-2222-2222-222222222222",
+                        "network": "tempo_testnet", "token": "usdc", "token_address": "0x" + "aa" * 20,
+                        "amount": 2_500_000, "decimals": 6, "is_default": True,
+                    }
+                ],
+            },
+        )
+    )
+    session = ap2.create_checkout_session(BASE_URL, API_KEY, [{"id": "button-1"}])
+    assert session.decimals == 6
 
 
 @respx.mock
@@ -52,7 +105,7 @@ def test_authorize_autonomous_sends_a_verifiable_closed_mandate():
         return_value=httpx.Response(200, json={"id": "sess-1"})
     )
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    session = ap2.CheckoutSession(session_id="sess-1", amount="1000", currency="USD", raw={})
+    session = ap2.CheckoutSession(session_id="sess-1", amount="1000", currency="USD", decimals=2, raw={})
 
     ap2.authorize_autonomous(BASE_URL, API_KEY, session, "agent-9", wallet)
 
@@ -74,7 +127,7 @@ def test_authorize_autonomous_raises_on_rejection():
         return_value=httpx.Response(402, json={"message": "spend limit exceeded"})
     )
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    session = ap2.CheckoutSession(session_id="sess-1", amount="1000", currency="USD", raw={})
+    session = ap2.CheckoutSession(session_id="sess-1", amount="1000", currency="USD", decimals=2, raw={})
 
     try:
         ap2.authorize_autonomous(BASE_URL, API_KEY, session, "agent-9", wallet)
@@ -179,7 +232,7 @@ def test_settle_autonomous_checkout_preserves_payin_id_and_flow_when_relay_submi
     approve()) — discarding that on failure would hide exactly the
     detail needed to know a payin exists server-side."""
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    session = ap2.CheckoutSession(session_id="sess-1", amount="1000", currency="USD", raw={})
+    session = ap2.CheckoutSession(session_id="sess-1", amount="1000", currency="USD", decimals=2, raw={})
 
     respx.post(f"{BASE_URL}/acp/checkout_sessions/sess-1/authorize_autonomous").mock(
         return_value=httpx.Response(200, json={"id": "sess-1"})

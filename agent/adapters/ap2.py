@@ -89,8 +89,9 @@ PERMIT_SELECTOR = _selector("permit(address,address,uint256,uint256,uint8,bytes3
 @dataclass(frozen=True)
 class CheckoutSession:
     session_id: str
-    amount: str  # minor units (matches the same USD-cents convention as agent limit fields)
-    currency: str
+    amount: str  # minor units, at `decimals` decimal places — NOT always 2
+    currency: str  # the settlement token's own name (e.g. "PATHUSD"), uppercased — not an ISO fiat code
+    decimals: int
     raw: dict[str, Any]
 
 
@@ -132,6 +133,35 @@ def _public_api_request(base_url: str, path: str, method: str = "GET", body: dic
     return parsed["data"]
 
 
+def _resolve_session_decimals(data: dict[str, Any], currency: str) -> int:
+    """`currency` is the settlement token's own name (`currency_for` in
+    acp_checkout_service.rs, Moramba's side), not an ISO fiat code — a
+    stablecoin's own decimals (6 for pathUSD, matching `erc20.py` and
+    every other rail's on-chain reads) govern its minor units, not a
+    fixed 2 the way real currency cents would. `payment_options[]` is
+    where the session reports each accepted token's own `decimals`;
+    matched by `selected_payout_destination_id` when present (multiple
+    options can share a token name across networks), else by name.
+
+    Found live (2026-10-02): hardcoding 2 here turned a real 1.5 pathUSD
+    checkout (1,500,000 minor units at 6 decimals) into 15,000 — a
+    10,000x inflation that then looked like a spend-limit violation for
+    an otherwise completely ordinary coffee purchase."""
+    options = data.get("payment_options") or []
+    selected_id = data.get("selected_payout_destination_id")
+    if selected_id is not None:
+        matching = next((o for o in options if o.get("payout_destination_id") == selected_id), None)
+        if matching is not None:
+            return int(matching["decimals"])
+    matching = next((o for o in options if str(o.get("token", "")).upper() == currency), None)
+    if matching is not None:
+        return int(matching["decimals"])
+    # No payment_options at all (e.g. a non-Moramba-aware ACP backend) —
+    # fall back to the one convention the ACP spec itself actually
+    # documents: minor units as real currency cents.
+    return 2
+
+
 def create_checkout_session(
     base_url: str,
     api_key: str,
@@ -148,10 +178,12 @@ def create_checkout_session(
         body["delivery_address"] = delivery_address
     data = _acp_request(base_url, api_key, "/checkout_sessions", "POST", body, timeout)
     totals = data.get("totals") or [{}]
+    currency = data.get("currency", "USD")
     return CheckoutSession(
         session_id=data["id"],
         amount=str(totals[0].get("amount", 0)),
-        currency=data.get("currency", "USD"),
+        currency=currency,
+        decimals=_resolve_session_decimals(data, currency),
         raw=data,
     )
 
