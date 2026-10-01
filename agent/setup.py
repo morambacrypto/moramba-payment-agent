@@ -16,6 +16,7 @@ itself) is plain, separately-testable functions.
 
 import getpass
 import os
+import secrets
 import uuid
 from pathlib import Path
 
@@ -75,6 +76,7 @@ def build_env_content(answers: dict) -> str:
         f"RPC_URL={answers['rpc_url']}",
         f"DB_PATH={answers['db_path']}",
         f"DEFAULT_TOKEN_CONTRACT={answers.get('default_token_contract', '')}",
+        f"AGENT_API_KEY={answers['api_key']}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -207,6 +209,14 @@ def run_wizard(input_fn=input, getpass_fn=getpass.getpass, env_path: str = ".env
     if default_token_contract:
         print(f"Detected default token contract from this agent's own config: {default_token_contract}\n")
 
+    # Generated, not asked — a partner has no reason to pick this
+    # themselves, and a random 32-byte token is stronger than anything
+    # they'd type. Required on every request once the service is running
+    # (see agent/api.py's `require_api_key` middleware); without it,
+    # anyone who gets the service's URL — especially the public one
+    # TUNNEL=1 prints — could call its payment routes directly.
+    api_key = secrets.token_urlsafe(32)
+
     answers = {
         "wallet_private_key": wallet_private_key,
         "moramba_agent_id": moramba_agent_id,
@@ -216,6 +226,7 @@ def run_wizard(input_fn=input, getpass_fn=getpass.getpass, env_path: str = ".env
         "rpc_url": rpc_url,
         "db_path": db_path,
         "default_token_contract": default_token_contract,
+        "api_key": api_key,
     }
 
     Path(env_path).write_text(build_env_content(answers))
@@ -223,6 +234,12 @@ def run_wizard(input_fn=input, getpass_fn=getpass.getpass, env_path: str = ".env
 
     print(f"\nWrote {env_path} (permissions set to 600).")
     print(f"Rails enabled: {', '.join(ALL_RAILS)}")
+    print(
+        f"\nAPI key (needed to connect any MCP client to this agent): {api_key}\n"
+        "Keep this like a password — anyone who has it can call this agent's payment "
+        "routes. It's saved in .env; you don't need to remember it, just paste it "
+        "into Claude's MCP connection settings once."
+    )
     print(
         "\nNext: confirm this loads correctly —\n"
         "  python3 -c \"from agent.engine import Agent; from agent.config import Settings; "

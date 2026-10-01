@@ -15,13 +15,15 @@ letting the MCP server lazily build its own, so there's exactly one
 wallet/DB connection per process, not two.
 """
 
+import hmac
 import logging
 import os
 from contextlib import AsyncExitStack, asynccontextmanager
 from decimal import Decimal, InvalidOperation
 
 from anyio import to_thread
-from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from agent import mcp_server
@@ -32,6 +34,12 @@ from agent.ledger import PaymentRecord
 logger = logging.getLogger("agent.api")
 
 _agent: Agent | None = None
+
+# Set from Settings().api_key at lifespan startup (see `lifespan` below).
+# None means the service is running with no request authentication at
+# all — the setup wizard always generates one, so this is only ever None
+# for a pre-existing .env from before this field existed.
+_api_key: str | None = None
 
 # Every route below is `def`, not `async def` — every rail (mpp/erc20/
 # x402/ap2/pay_button/agent_transfer) makes blocking httpx/web3 calls, so
@@ -67,7 +75,7 @@ _current_mcp_routes: list = []
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _agent
+    global _agent, _api_key
     pool_size = int(os.environ.get("AGENT_THREAD_POOL_SIZE", _DEFAULT_THREAD_POOL_SIZE))
     to_thread.current_default_thread_limiter().total_tokens = pool_size
     mcp_app = mcp_server.mcp.streamable_http_app(streamable_http_path="/mcp")
@@ -81,10 +89,19 @@ async def lifespan(app: FastAPI):
         # sub-app lifespans, so it has to be entered explicitly here.
         await stack.enter_async_context(mcp_app.router.lifespan_context(mcp_app))
         try:
-            _agent = Agent(Settings())
+            settings = Settings()
+            _agent = Agent(settings)
+            _api_key = settings.api_key
         except Exception as exc:  # noqa: BLE001 - a misconfigured .env shouldn't crash-loop the service
             logger.error("failed to initialize Agent from Settings(): %s", exc)
             _agent = None
+            _api_key = None
+        if not _api_key:
+            logger.warning(
+                "AGENT_API_KEY not set — this service is accepting requests with no "
+                "authentication at all. Safe only if nothing but this process can "
+                "reach its port; never combine with TUNNEL=1 like this."
+            )
         mcp_server._agent = _agent
         try:
             yield
@@ -92,6 +109,7 @@ async def lifespan(app: FastAPI):
             if _agent is not None:
                 _agent.close()
             _agent = None
+            _api_key = None
             mcp_server._agent = None
 
 
@@ -103,6 +121,21 @@ def get_agent() -> Agent:
 
 app = FastAPI(title="Moramba Payment Agent", lifespan=lifespan)
 router = APIRouter(prefix="/payment-agent-api")
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    """Applies to every route on `app`, including `/mcp` (its routes are
+    spliced directly into `app.router.routes` in `lifespan`, not mounted
+    as a sub-app) — middleware wraps the whole ASGI app regardless of how
+    a route was registered, so this is the one place that covers both
+    surfaces. A no-op when `_api_key` is unset (see its definition above)."""
+    if _api_key:
+        expected = f"Bearer {_api_key}"
+        got = request.headers.get("authorization", "")
+        if not hmac.compare_digest(got, expected):
+            return JSONResponse({"detail": "missing or invalid API key"}, status_code=401)
+    return await call_next(request)
 
 
 def _parse_amount(raw: str) -> Decimal:

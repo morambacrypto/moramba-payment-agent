@@ -83,6 +83,41 @@ def test_health_returns_wallet_address_when_agent_injected(tmp_path):
         agent.close()
 
 
+def test_request_rejected_without_a_matching_api_key_when_one_is_configured(tmp_path):
+    """Regression test for a real gap: TUNNEL=1 exposes this service on a
+    public URL with no auth of its own. Anyone who got that URL could
+    otherwise call any pay_* route directly, bounded only by the agent's
+    spend limits, not blocked outright."""
+    agent = make_agent(tmp_path)
+    api.app.dependency_overrides[api.get_agent] = lambda: agent
+    try:
+        with TestClient(api.app) as client:
+            api._api_key = "secret-123"
+            no_header = client.get("/payment-agent-api/health")
+            wrong_header = client.get("/payment-agent-api/health", headers={"Authorization": "Bearer wrong"})
+            right_header = client.get("/payment-agent-api/health", headers={"Authorization": "Bearer secret-123"})
+        assert no_header.status_code == 401
+        assert wrong_header.status_code == 401
+        assert right_header.status_code == 200
+    finally:
+        api.app.dependency_overrides.pop(api.get_agent, None)
+        api._api_key = None
+        agent.close()
+
+
+def test_request_allowed_without_any_header_when_no_api_key_configured(tmp_path):
+    agent = make_agent(tmp_path)
+    api.app.dependency_overrides[api.get_agent] = lambda: agent
+    try:
+        with TestClient(api.app) as client:
+            api._api_key = None
+            response = client.get("/payment-agent-api/health")
+        assert response.status_code == 200
+    finally:
+        api.app.dependency_overrides.pop(api.get_agent, None)
+        agent.close()
+
+
 def test_lifespan_raises_thread_pool_limit_above_anyios_default(tmp_path, monkeypatch):
     """Every route is sync (the rails make blocking httpx/web3 calls), so
     concurrent throughput is capped by anyio's thread pool, not by asyncio

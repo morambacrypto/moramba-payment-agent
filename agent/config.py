@@ -23,6 +23,14 @@ class Settings(BaseSettings):
 
     db_path: str = "moramba_payment_agent.db"
 
+    # Shared secret required on every request to this process's HTTP/MCP
+    # server (`Authorization: Bearer <api_key>`) — generated once by the
+    # setup wizard. Left unset, the server runs with no request auth at
+    # all: fine for a purely local connection, but never safe to combine
+    # with TUNNEL=1, since anyone with that public URL could otherwise
+    # call every pay_* route directly.
+    api_key: str | None = None
+
     # ERC20 token contract used by the `transfer_erc20` rail when a token
     # symbol isn't resolvable through Moramba's own token list. Optional —
     # only required if that rail is used with a raw contract address.
