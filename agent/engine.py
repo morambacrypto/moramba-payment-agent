@@ -328,12 +328,16 @@ class Agent:
         Closed Mandate signature (`authorize_autonomous`) — nothing is
         signed before the check passes.
 
-        `token` for the limit check/ledger is the checkout's fiat currency
-        (e.g. "USD"), not the crypto token actually settled on-chain — that
-        isn't known until deep into the flow (`fetch_payrequest_init`,
-        after the mandate is already signed). A `token_allowed` allow-list
-        keyed on crypto symbols won't match a fiat currency code; leave it
-        unrestricted, or include the currency code, if this rail is used.
+        `token` for the limit check/ledger is `session.currency` — the
+        settlement token's own name (e.g. "PATHUSD"), uppercased, exactly
+        as Moramba's own checkout session reports it
+        (`currency_for` in acp_checkout_service.rs), not a fiat code. It's
+        checked against `allowed_tokens` the same as every other rail.
+        `session.amount` is converted using `session.decimals` (also read
+        from the session's own `payment_options`, not assumed) — found
+        live (2026-10-02): assuming a fixed 2 decimals (fiat cents) turned
+        a real 1.5 pathUSD checkout into 15,000, which then looked like a
+        spend-limit violation.
         """
         key = api_key or self._settings.moramba_acp_api_key
         recipient = items[0].get("id", "unknown") if items else "unknown"
@@ -346,7 +350,7 @@ class Agent:
         session = ap2.create_checkout_session(
             self._settings.moramba_api_base_url, key, items, buyer=buyer, delivery_address=delivery_address
         )
-        amount = Decimal(session.amount) / 100
+        amount = Decimal(session.amount) / (Decimal(10) ** session.decimals)
         recipient = items[0].get("id", session.session_id)
 
         check = self.check_spend_limits(recipient=recipient, token=session.currency, amount=amount, rail="ap2")
