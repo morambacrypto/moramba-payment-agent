@@ -46,6 +46,7 @@ def make_settings(tmp_path, **overrides) -> Settings:
         chain_id=42431,
         rpc_url="https://tempo-testnet.example",
         db_path=str(tmp_path / "agent.db"),
+        payment_agent_api_key="test-agent-api-key",
     )
     defaults.update(overrides)
     return Settings(**defaults)

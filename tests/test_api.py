@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from agent.ledger import STATUS_REJECTED, STATUS_SETTLED
 TEST_PRIVATE_KEY = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
 AGENT_ID = "44444444-4444-4444-4444-444444444444"
 MORAMBA_BASE = "https://moramba.example"
+TEST_API_KEY = "test-payment-agent-api-key"
 
 
 def make_agent(tmp_path) -> Agent:
@@ -26,8 +28,25 @@ def make_agent(tmp_path) -> Agent:
         chain_id=42431,
         rpc_url="https://tempo-testnet.example",
         db_path=str(tmp_path / "agent.db"),
+        payment_agent_api_key=TEST_API_KEY,
     )
     return Agent(settings)
+
+
+@contextmanager
+def authed_client(**kwargs):
+    """A TestClient that satisfies `require_api_key` on every request it
+    sends, for tests whose focus is the business logic behind a route,
+    not the auth gate itself (see the dedicated auth tests below for
+    that). `require_api_key` middleware reads the module-level `_api_key`
+    set by `lifespan` on startup — the real Settings() call it makes
+    almost always fails in a test run (no real .env with these exact
+    fields in cwd), so it's set explicitly here, after startup, the same
+    way `api._agent` is overridden elsewhere in this file. Extra kwargs
+    (e.g. `base_url`) pass straight through to `TestClient`."""
+    with TestClient(api.app, headers={"Authorization": f"Bearer {TEST_API_KEY}"}, **kwargs) as client:
+        api._api_key = TEST_API_KEY
+        yield client
 
 
 def mock_agent_lookup(wallet_address: str, **payout_overrides):
@@ -60,7 +79,7 @@ def mock_agent_lookup(wallet_address: str, **payout_overrides):
 
 def test_health_returns_503_when_agent_not_initialized():
     api.app.dependency_overrides.pop(api.get_agent, None)
-    with TestClient(api.app) as client:
+    with authed_client() as client:
         # Force "not initialized" explicitly rather than relying on the
         # lifespan's real Settings() call failing — it would succeed (and
         # this assumption silently break) in any working directory that
@@ -74,7 +93,7 @@ def test_health_returns_wallet_address_when_agent_injected(tmp_path):
     agent = make_agent(tmp_path)
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:
-        with TestClient(api.app) as client:
+        with authed_client() as client:
             response = client.get("/payment-agent-api/health")
         assert response.status_code == 200
         assert response.json()["wallet_address"] == agent.wallet.address
@@ -105,14 +124,18 @@ def test_request_rejected_without_a_matching_api_key_when_one_is_configured(tmp_
         agent.close()
 
 
-def test_request_allowed_without_any_header_when_no_api_key_configured(tmp_path):
+def test_request_rejected_without_any_header_when_no_api_key_is_configured(tmp_path):
+    """Deny-by-default, not fail-open: a missing PAYMENT_AGENT_API_KEY
+    (or a .env that failed to load at all) must mean nothing gets in —
+    this was the real gap found live, where an agent with no key set in
+    .env happily settled a payment with no Authorization header at all."""
     agent = make_agent(tmp_path)
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:
         with TestClient(api.app) as client:
             api._api_key = None
             response = client.get("/payment-agent-api/health")
-        assert response.status_code == 200
+        assert response.status_code == 401
     finally:
         api.app.dependency_overrides.pop(api.get_agent, None)
         agent.close()
@@ -161,7 +184,7 @@ def test_pay_mpp_endpoint_settles_and_returns_record(tmp_path):
 
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:
-        with TestClient(api.app) as client:
+        with authed_client() as client:
             response = client.post(
                 "/payment-agent-api/pay/mpp",
                 json={
@@ -188,7 +211,7 @@ def test_transfer_endpoint_rejects_when_agent_has_no_payout_tokens_configured(tm
 
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:
-        with TestClient(api.app) as client:
+        with authed_client() as client:
             response = client.post(
                 "/payment-agent-api/transfer", json={"to_address": "0x" + "11" * 20, "amount": "1", "token": "USDC"}
             )
@@ -212,7 +235,7 @@ def test_transfer_endpoint_forwards_explicit_gas_limit(tmp_path):
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:
         with patch.object(engine_module.erc20, "pay", return_value=PaymentResult(success=True, tx_hash="0xhighgas")) as mock_pay:
-            with TestClient(api.app) as client:
+            with authed_client() as client:
                 response = client.post(
                     "/payment-agent-api/transfer",
                     json={
@@ -232,7 +255,7 @@ def test_invalid_amount_returns_400(tmp_path):
     agent = make_agent(tmp_path)
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:
-        with TestClient(api.app) as client:
+        with authed_client() as client:
             response = client.post(
                 "/payment-agent-api/transfer", json={"to_address": "0x" + "11" * 20, "amount": "not-a-number", "token": "USDC"}
             )
@@ -267,7 +290,7 @@ def test_pay_button_endpoint_rejects_by_local_limit(tmp_path):
 
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:
-        with TestClient(api.app) as client:
+        with authed_client() as client:
             response = client.post("/payment-agent-api/pay/button", json={"button_id": button_id})
         assert response.status_code == 200
         body = response.json()
@@ -310,7 +333,7 @@ def test_pay_agent_endpoint_settles_and_returns_receiving_agent_id(tmp_path):
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:
         with patch.object(engine_module.erc20, "pay", return_value=PaymentResult(success=True, tx_hash="0xagentapi")):
-            with TestClient(api.app) as client:
+            with authed_client() as client:
                 response = client.post(
                     "/payment-agent-api/pay/agent",
                     json={"receiving_agent_id": receiving_agent_id, "amount": "1"},
@@ -332,7 +355,7 @@ def test_check_limits_endpoint(tmp_path):
 
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:
-        with TestClient(api.app) as client:
+        with authed_client() as client:
             response = client.post(
                 "/payment-agent-api/limits/check", json={"recipient": "vendor-a", "token": "USDC", "amount": "5", "rail": "mpp"}
             )
@@ -351,7 +374,7 @@ def test_list_payments_endpoint_returns_ledger_history(tmp_path):
 
     api.app.dependency_overrides[api.get_agent] = lambda: agent
     try:
-        with TestClient(api.app) as client:
+        with authed_client() as client:
             response = client.get("/payment-agent-api/payments")
         assert response.status_code == 200
         body = response.json()
@@ -398,7 +421,7 @@ def test_pay_payin_endpoint_settles(tmp_path):
                 engine_module.payin_adapter, "pay_payin",
                 return_value=engine_module.payin_adapter.PayinSettlementResult(success=True, tx_hash="0xpayinapi", flow="plain"),
             ):
-                with TestClient(api.app) as client:
+                with authed_client() as client:
                     response = client.post("/payment-agent-api/pay/payin", json={"payin_id": payin_id})
         assert response.status_code == 200
         body = response.json()
@@ -421,7 +444,7 @@ def test_mcp_tool_server_is_reachable_on_the_same_app_at_slash_mcp(tmp_path):
         # only allows `127.0.0.1`/`localhost`/`[::1]` Host headers —
         # TestClient's default base_url ("testserver") gets rejected
         # (421), so point it at a permitted host instead.
-        with TestClient(api.app, base_url="http://127.0.0.1:8000") as client:
+        with authed_client(base_url="http://127.0.0.1:8000") as client:
             response = client.post(
                 "/mcp/",
                 headers={"Accept": "application/json, text/event-stream"},
