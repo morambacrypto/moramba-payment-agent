@@ -24,12 +24,13 @@ from decimal import Decimal, InvalidOperation
 from anyio import to_thread
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from agent import mcp_server
 from agent.config import Settings
 from agent.engine import Agent
 from agent.ledger import PaymentRecord
+from agent.setup import ensure_payment_agent_api_key
 
 logger = logging.getLogger("agent.api")
 
@@ -90,7 +91,21 @@ async def lifespan(app: FastAPI):
         # sub-app lifespans, so it has to be entered explicitly here.
         await stack.enter_async_context(mcp_app.router.lifespan_context(mcp_app))
         try:
-            settings = Settings()
+            try:
+                settings = Settings()
+            except ValidationError as exc:
+                # Specifically a pre-existing .env from before
+                # payment_agent_api_key existed, with every other
+                # required field already present and valid — generate
+                # and persist one rather than making a partner re-run the
+                # whole interactive wizard just to add this one line. Any
+                # other missing/invalid field still falls through to the
+                # generic handler below, unchanged.
+                if {e["loc"][0] for e in exc.errors()} == {"payment_agent_api_key"}:
+                    ensure_payment_agent_api_key()
+                    settings = Settings()
+                else:
+                    raise
             _agent = Agent(settings)
             _api_key = settings.payment_agent_api_key
         except Exception as exc:  # noqa: BLE001 - a misconfigured .env shouldn't crash-loop the service
@@ -101,7 +116,7 @@ async def lifespan(app: FastAPI):
             logger.error(
                 "PAYMENT_AGENT_API_KEY not set (or .env failed to load) — every "
                 "request to this service will be rejected with 401 until it's set. "
-                "Run moramba-payment-agent-setup to generate one."
+                "Run moramba-payment-agent-show-key to generate and print one."
             )
         mcp_server._agent = _agent
         try:

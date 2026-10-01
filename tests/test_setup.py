@@ -218,3 +218,50 @@ def test_run_wizard_reprompts_on_invalid_private_key_then_accepts(tmp_path):
 
     assert env_path.exists()
     assert f"WALLET_PRIVATE_KEY={TEST_PRIVATE_KEY}" in env_path.read_text()
+
+
+def test_ensure_payment_agent_api_key_generates_when_missing(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("WALLET_PRIVATE_KEY=0x1\nMORAMBA_AGENT_ID=abc\n")
+
+    key = setup.ensure_payment_agent_api_key(str(env_path))
+
+    assert len(key) > 20
+    content = env_path.read_text()
+    assert f"PAYMENT_AGENT_API_KEY={key}" in content
+    assert "WALLET_PRIVATE_KEY=0x1" in content  # untouched
+    assert oct(env_path.stat().st_mode)[-3:] == "600"
+
+
+def test_ensure_payment_agent_api_key_is_stable_across_calls(tmp_path):
+    """The whole point: a second call (e.g. the next service restart)
+    must return the SAME key, not silently rotate it out from under an
+    already-configured Claude connection."""
+    env_path = tmp_path / ".env"
+    env_path.write_text("")
+
+    first = setup.ensure_payment_agent_api_key(str(env_path))
+    second = setup.ensure_payment_agent_api_key(str(env_path))
+
+    assert first == second
+    assert env_path.read_text().count("PAYMENT_AGENT_API_KEY=") == 1
+
+
+def test_ensure_payment_agent_api_key_leaves_an_existing_value_alone(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("PAYMENT_AGENT_API_KEY=already-set-value\n")
+
+    assert setup.ensure_payment_agent_api_key(str(env_path)) == "already-set-value"
+
+
+def test_rotate_payment_agent_api_key_overwrites_an_existing_value(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("PAYMENT_AGENT_API_KEY=old-value\nWALLET_PRIVATE_KEY=0x1\n")
+
+    new_key = setup.rotate_payment_agent_api_key(str(env_path))
+
+    assert new_key != "old-value"
+    content = env_path.read_text()
+    assert f"PAYMENT_AGENT_API_KEY={new_key}" in content
+    assert "old-value" not in content
+    assert "WALLET_PRIVATE_KEY=0x1" in content  # untouched

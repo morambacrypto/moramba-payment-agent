@@ -17,6 +17,7 @@ itself) is plain, separately-testable functions.
 import getpass
 import os
 import secrets
+import sys
 import uuid
 from pathlib import Path
 
@@ -252,6 +253,76 @@ def run_wizard(input_fn=input, getpass_fn=getpass.getpass, env_path: str = ".env
         f"and check that address matches {wallet_address} above.\n"
         "(If you're working from a source checkout rather than a pip install, "
         "`python -m pytest -q` still confirms the test suite passes.)"
+    )
+
+
+def _write_api_key(env_path: str, key: str) -> None:
+    path = Path(env_path)
+    lines = path.read_text().splitlines() if path.exists() else []
+    lines = [line for line in lines if not line.startswith("PAYMENT_AGENT_API_KEY=")]
+    lines.append(f"PAYMENT_AGENT_API_KEY={key}")
+    path.write_text("\n".join(lines) + "\n")
+    os.chmod(path, 0o600)
+
+
+def ensure_payment_agent_api_key(env_path: str = ".env") -> str:
+    """Returns the current PAYMENT_AGENT_API_KEY from `env_path`, generating
+    and persisting a new one first if it's missing or blank. Called from
+    two places: `agent/api.py`'s `lifespan` (so an `.env` from before this
+    field existed doesn't need a full wizard re-run, just to boot
+    authenticated) and `moramba-payment-agent-show-key` below (so a
+    partner who lost the value Claude needs can get it back without
+    touching their wallet key or any other field). Generated once, then
+    stable: a later call with the same `env_path` returns the same key —
+    callers must never see it silently change under an already-configured
+    Claude connection. For the opposite — force a new value even when one
+    already exists — see `rotate_payment_agent_api_key` below."""
+    path = Path(env_path)
+    lines = path.read_text().splitlines() if path.exists() else []
+    for line in lines:
+        if line.startswith("PAYMENT_AGENT_API_KEY=") and line.removeprefix("PAYMENT_AGENT_API_KEY=").strip():
+            return line.removeprefix("PAYMENT_AGENT_API_KEY=").strip()
+
+    key = secrets.token_urlsafe(32)
+    _write_api_key(env_path, key)
+    return key
+
+
+def rotate_payment_agent_api_key(env_path: str = ".env") -> str:
+    """`moramba-payment-agent-rotate-key` — generates a brand new key and
+    overwrites whatever was in .env, unconditionally (unlike
+    `ensure_payment_agent_api_key`, which leaves an existing value alone).
+    Use this when the old key may have leaked — e.g. it was pasted
+    somewhere it shouldn't have been, or the TUNNEL=1 URL it was paired
+    with got shared too widely — not for routine use: every Claude
+    connection holding the old key (Code, Desktop, web) stops working the
+    moment the service restarts, and must be updated with the new value
+    this prints."""
+    key = secrets.token_urlsafe(32)
+    _write_api_key(env_path, key)
+    return key
+
+
+def show_key(env_path: str = ".env") -> None:
+    """`moramba-payment-agent-show-key` — prints the key Claude needs for
+    the Authorization header, generating one first if this .env predates
+    PAYMENT_AGENT_API_KEY. Exists because the wizard only ever prints it
+    once, at creation; this is how a partner gets it back later without
+    re-running the whole wizard (which would ask for the wallet key and
+    agent id all over again just to see one unrelated field)."""
+    key = ensure_payment_agent_api_key(env_path)
+    print(key)
+
+
+def rotate_key() -> None:
+    """`moramba-payment-agent-rotate-key` console-script entry."""
+    key = rotate_payment_agent_api_key()
+    print(key)
+    print(
+        "\nSaved the new key to .env. Every existing Claude connection using the "
+        "old one (Code, Desktop, web) will stop working next time the service "
+        "restarts — update each with this new value.",
+        file=sys.stderr,
     )
 
 

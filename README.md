@@ -209,6 +209,18 @@ especially the public one `TUNNEL=1` prints, could call any `pay_*`
 route directly, bounded only by the agent's own spend limits, not
 blocked outright.
 
+Managing the key after setup:
+
+```
+moramba-payment-agent-show-key     # print it again (generates + saves one if .env has none)
+moramba-payment-agent-rotate-key   # generate a NEW one, overwrite it in .env, print it
+```
+
+If `.env` is valid but simply predates this field, `moramba-payment-agent-serve`
+also generates and saves one on boot — no need to re-run the wizard. After
+`rotate-key`, update the header in every Claude connection (Code, Desktop,
+web) — the old value stops working on the next service restart.
+
 ## 1. Why
 
 Moramba already has AI agents that can *decide* things (the moramba-chat-agent
