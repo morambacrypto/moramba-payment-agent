@@ -1,3 +1,5 @@
+import os
+import signal
 import socket
 from unittest.mock import patch
 
@@ -19,9 +21,166 @@ def test_find_free_port_returns_different_ports_across_calls():
     assert len(ports) > 1
 
 
-def test_main_auto_selects_a_free_port_when_none_pinned(monkeypatch):
+def test_is_port_free_true_for_an_unbound_port():
+    port = serve.find_free_port()
+    assert serve._is_port_free("127.0.0.1", port) is True
+
+
+def test_is_port_free_false_for_a_port_already_bound():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+        held.bind(("127.0.0.1", 0))
+        held.listen(1)
+        port = held.getsockname()[1]
+        assert serve._is_port_free("127.0.0.1", port) is False
+
+
+def test_read_previous_pid_returns_none_when_file_missing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert serve._read_previous_pid() is None
+
+
+def test_read_previous_pid_returns_none_for_garbage_contents(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / serve._PID_FILE).write_text("not-a-pid")
+    assert serve._read_previous_pid() is None
+
+
+def test_write_and_read_pid_file_round_trips(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    serve._write_pid_file()
+    assert serve._read_previous_pid() == os.getpid()
+
+
+def test_process_alive_true_for_this_process():
+    assert serve._process_alive(os.getpid()) is True
+
+
+def test_process_alive_false_for_a_pid_that_does_not_exist():
+    assert serve._process_alive(2**30) is False  # vanishingly unlikely to be a real pid
+
+
+def test_looks_like_our_process_true_when_proc_is_unavailable():
+    with patch("builtins.open", side_effect=FileNotFoundError):
+        assert serve._looks_like_our_process(999_999) is True
+
+
+def test_looks_like_our_process_checks_cmdline_contents():
+    with patch("builtins.open", return_value=_FakeCmdlineFile(b"/usr/bin/python3\x00moramba-payment-agent-serve\x00")):
+        assert serve._looks_like_our_process(123) is True
+    with patch("builtins.open", return_value=_FakeCmdlineFile(b"some-other-program\x00")):
+        assert serve._looks_like_our_process(123) is False
+
+
+class _FakeCmdlineFile:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self):
+        return self._data
+
+
+def test_resolve_port_returns_port_immediately_when_free():
+    with patch.object(serve, "_is_port_free", return_value=True):
+        assert serve._resolve_port("127.0.0.1", 12345) == 12345
+
+
+def test_resolve_port_stops_a_previous_instance_and_reclaims_the_port():
+    calls = {"n": 0}
+
+    def fake_is_free(host, port):
+        calls["n"] += 1
+        return calls["n"] > 1  # taken on the first check, free after "stopping"
+
+    with patch.object(serve, "_is_port_free", side_effect=fake_is_free), \
+         patch.object(serve, "_read_previous_pid", return_value=4242), \
+         patch.object(serve, "_process_alive", return_value=True), \
+         patch.object(serve, "_looks_like_our_process", return_value=True), \
+         patch.object(serve, "_stop_previous_instance") as mock_stop:
+        port = serve._resolve_port("127.0.0.1", 58417)
+
+    mock_stop.assert_called_once_with(4242, "127.0.0.1", 58417)
+    assert port == 58417
+
+
+def test_resolve_port_leaves_an_unrelated_processs_port_alone():
+    with patch.object(serve, "_is_port_free", return_value=False), \
+         patch.object(serve, "_read_previous_pid", return_value=None):
+        assert serve._resolve_port("127.0.0.1", 58417) is None
+
+
+def test_resolve_port_does_not_kill_a_dead_pids_leftover_file():
+    with patch.object(serve, "_is_port_free", return_value=False), \
+         patch.object(serve, "_read_previous_pid", return_value=4242), \
+         patch.object(serve, "_process_alive", return_value=False), \
+         patch.object(serve, "_stop_previous_instance") as mock_stop:
+        assert serve._resolve_port("127.0.0.1", 58417) is None
+    mock_stop.assert_not_called()
+
+
+def test_resolve_port_does_not_kill_a_pid_that_does_not_look_like_our_process():
+    with patch.object(serve, "_is_port_free", return_value=False), \
+         patch.object(serve, "_read_previous_pid", return_value=4242), \
+         patch.object(serve, "_process_alive", return_value=True), \
+         patch.object(serve, "_looks_like_our_process", return_value=False), \
+         patch.object(serve, "_stop_previous_instance") as mock_stop:
+        assert serve._resolve_port("127.0.0.1", 58417) is None
+    mock_stop.assert_not_called()
+
+
+def test_stop_previous_instance_sends_sigterm_and_waits_for_the_port(monkeypatch):
+    sent = {}
+
+    def fake_kill(pid, sig):
+        sent["pid"] = pid
+        sent["sig"] = sig
+
+    calls = {"n": 0}
+
+    def fake_is_free(host, port):
+        calls["n"] += 1
+        return calls["n"] > 2  # free on the third poll
+
+    monkeypatch.setattr(serve.os, "kill", fake_kill)
+    monkeypatch.setattr(serve.time, "sleep", lambda s: None)
+    with patch.object(serve, "_is_port_free", side_effect=fake_is_free):
+        serve._stop_previous_instance(4242, "127.0.0.1", 58417)
+
+    assert sent == {"pid": 4242, "sig": signal.SIGTERM}
+
+
+def test_stop_previous_instance_gives_up_quietly_if_process_already_gone(monkeypatch):
+    def fake_kill(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(serve.os, "kill", fake_kill)
+    serve._stop_previous_instance(4242, "127.0.0.1", 58417)  # must not raise
+
+
+def test_main_uses_preferred_port_when_resolve_succeeds(tmp_path, monkeypatch):
     monkeypatch.delenv("PORT", raising=False)
-    with patch.object(serve, "find_free_port", return_value=54321) as mock_find, \
+    monkeypatch.chdir(tmp_path)
+    with patch.object(serve, "_resolve_port", return_value=serve._PREFERRED_PORT) as mock_resolve, \
+         patch.object(serve, "find_free_port") as mock_find, \
+         patch.object(serve.uvicorn, "run") as mock_run:
+        serve.main()
+
+    mock_resolve.assert_called_once_with("127.0.0.1", serve._PREFERRED_PORT)
+    mock_find.assert_not_called()
+    mock_run.assert_called_once_with("agent.api:app", host="127.0.0.1", port=serve._PREFERRED_PORT)
+    assert (tmp_path / serve._PID_FILE).read_text() == str(os.getpid())
+
+
+def test_main_falls_back_to_a_free_port_when_preferred_port_resolve_fails(tmp_path, monkeypatch):
+    monkeypatch.delenv("PORT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    with patch.object(serve, "_resolve_port", return_value=None), \
+         patch.object(serve, "find_free_port", return_value=54321) as mock_find, \
          patch.object(serve.uvicorn, "run") as mock_run:
         serve.main()
 
@@ -29,20 +188,41 @@ def test_main_auto_selects_a_free_port_when_none_pinned(monkeypatch):
     mock_run.assert_called_once_with("agent.api:app", host="127.0.0.1", port=54321)
 
 
-def test_main_uses_pinned_port_without_calling_find_free_port(monkeypatch):
+def test_main_uses_pinned_port_when_resolve_succeeds(tmp_path, monkeypatch):
     monkeypatch.setenv("PORT", "9999")
-    with patch.object(serve, "find_free_port") as mock_find, \
+    monkeypatch.chdir(tmp_path)
+    with patch.object(serve, "_resolve_port", return_value=9999) as mock_resolve, \
+         patch.object(serve, "find_free_port") as mock_find, \
          patch.object(serve.uvicorn, "run") as mock_run:
         serve.main()
 
+    mock_resolve.assert_called_once_with("127.0.0.1", 9999)
     mock_find.assert_not_called()
     mock_run.assert_called_once_with("agent.api:app", host="127.0.0.1", port=9999)
 
 
-def test_main_respects_host_env_var(monkeypatch):
+def test_main_raises_when_pinned_port_resolve_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("PORT", "8080")
+    monkeypatch.chdir(tmp_path)
+    with patch.object(serve, "_resolve_port", return_value=None), \
+         patch.object(serve.uvicorn, "run") as mock_run:
+        raised = None
+        try:
+            serve.main()
+        except RuntimeError as exc:
+            raised = exc
+
+    assert raised is not None
+    assert "8080" in str(raised)
+    mock_run.assert_not_called()
+
+
+def test_main_respects_host_env_var(tmp_path, monkeypatch):
     monkeypatch.setenv("HOST", "0.0.0.0")
     monkeypatch.setenv("PORT", "8080")
-    with patch.object(serve.uvicorn, "run") as mock_run:
+    monkeypatch.chdir(tmp_path)
+    with patch.object(serve, "_resolve_port", return_value=8080), \
+         patch.object(serve.uvicorn, "run") as mock_run:
         serve.main()
 
     mock_run.assert_called_once_with("agent.api:app", host="0.0.0.0", port=8080)
