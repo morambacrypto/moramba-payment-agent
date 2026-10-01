@@ -170,6 +170,10 @@ class PayAgentRequest(BaseModel):
     token: str | None = None
 
 
+class PayPayinRequest(BaseModel):
+    payin_id: str
+
+
 @router.get("/health")
 def health(agent: Agent = Depends(get_agent)):
     return {"status": "ok", "wallet_address": agent.wallet.address}
@@ -239,6 +243,12 @@ def pay_agent_route(req: PayAgentRequest, agent: Agent = Depends(get_agent)):
         amount=_parse_amount(req.amount),
         token=req.token,
     )
+    return _record_to_dict(record)
+
+
+@router.post("/pay/payin")
+def pay_payin_route(req: PayPayinRequest, agent: Agent = Depends(get_agent)):
+    record = agent.pay_via_payin_id(payin_id=req.payin_id)
     return _record_to_dict(record)
 
 

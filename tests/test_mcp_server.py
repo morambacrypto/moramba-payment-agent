@@ -21,7 +21,7 @@ _KEY_LIKE_SUBSTRINGS = ("private_key", "privatekey", "secret", "wallet_key")
 # The exact tool set README section 6's Surfaces table promises for the
 # MCP server.
 EXPECTED_TOOLS = {
-    "pay_via_mpp", "transfer_erc20", "pay_via_x402", "pay_via_ap2", "pay_via_pay_button", "pay_agent",
+    "pay_via_mpp", "transfer_erc20", "pay_via_x402", "pay_via_ap2", "pay_via_pay_button", "pay_agent", "pay_payin",
     "check_spend_limits", "list_payments",
 }
 
@@ -284,6 +284,48 @@ def test_pay_agent_tool_settles(tmp_path):
         assert result["status"] == STATUS_SETTLED
         assert result["tx_hash"] == "0xagentmcp"
         assert result["receiving_agent_id"] == receiving_agent_id
+    finally:
+        mcp_server._agent = None
+        agent.close()
+
+
+def test_pay_payin_tool_settles(tmp_path):
+    agent = make_agent(tmp_path)
+    payin_id = "payin-mcp-1"
+    mcp_server._agent = agent
+    try:
+        with respx.mock:
+            mock_agent_lookup(agent.wallet.address, allowed_tokens=[{"token_name": "pathusd"}])
+            respx.get(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/payrequest/init/{payin_id}/address/{agent.wallet.address}").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "success": True, "message": "ok",
+                        "data": {
+                            "token_address": "0x20c0000000000000000000000000000000000000", "token_name": "pathusd",
+                            "amount": "1000000", "chain_id": 42431, "rpc": "https://rpc.moderato.tempo.xyz",
+                            "verify_sc_address": "0x" + "33" * 20, "to": "0x6784f65225f7d567cf1535525b0dd720b1450d1b",
+                            "transaction_id": "tx-mcp-1", "nonce": "0",
+                        },
+                    },
+                )
+            )
+            respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+                return_value=httpx.Response(404)
+            )
+            with patch("agent.adapters.payin.Web3") as MockWeb3:
+                MockWeb3.to_checksum_address.side_effect = lambda a: a
+                w3 = MockWeb3.return_value
+                contract = w3.eth.contract.return_value
+                contract.functions.decimals.return_value.call.return_value = 6
+
+                with patch.object(
+                    engine_module.payin_adapter, "pay_payin",
+                    return_value=engine_module.payin_adapter.PayinSettlementResult(success=True, tx_hash="0xpayinmcp", flow="plain"),
+                ):
+                    result = _call("pay_payin", {"payin_id": payin_id})
+        assert result["status"] == STATUS_SETTLED
+        assert result["tx_hash"] == "0xpayinmcp"
     finally:
         mcp_server._agent = None
         agent.close()

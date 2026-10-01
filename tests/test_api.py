@@ -328,6 +328,53 @@ def test_list_payments_endpoint_returns_ledger_history(tmp_path):
         agent.close()
 
 
+@respx.mock
+def test_pay_payin_endpoint_settles(tmp_path):
+    agent = make_agent(tmp_path)
+    payin_id = "payin-api-1"
+    mock_agent_lookup(agent.wallet.address, allowed_tokens=[{"token_name": "pathusd"}])
+    respx.get(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/payrequest/init/{payin_id}/address/{agent.wallet.address}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "message": "ok",
+                "data": {
+                    "token_address": "0x20c0000000000000000000000000000000000000", "token_name": "pathusd",
+                    "amount": "1000000", "chain_id": 42431, "rpc": "https://rpc.moderato.tempo.xyz",
+                    "verify_sc_address": "0x" + "33" * 20, "to": "0x6784f65225f7d567cf1535525b0dd720b1450d1b",
+                    "transaction_id": "tx-api-1", "nonce": "0",
+                },
+            },
+        )
+    )
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+
+    api.app.dependency_overrides[api.get_agent] = lambda: agent
+    try:
+        with patch("agent.adapters.payin.Web3") as MockWeb3:
+            MockWeb3.to_checksum_address.side_effect = lambda a: a
+            w3 = MockWeb3.return_value
+            contract = w3.eth.contract.return_value
+            contract.functions.decimals.return_value.call.return_value = 6
+
+            with patch.object(
+                engine_module.payin_adapter, "pay_payin",
+                return_value=engine_module.payin_adapter.PayinSettlementResult(success=True, tx_hash="0xpayinapi", flow="plain"),
+            ):
+                with TestClient(api.app) as client:
+                    response = client.post("/payment-agent-api/pay/payin", json={"payin_id": payin_id})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == STATUS_SETTLED
+        assert body["tx_hash"] == "0xpayinapi"
+        assert body["token"] == "pathusd"
+    finally:
+        api.app.dependency_overrides.pop(api.get_agent, None)
+        agent.close()
+
+
 def test_mcp_tool_server_is_reachable_on_the_same_app_at_slash_mcp(tmp_path):
     """One process, one port for both surfaces — this is what makes
     `/mcp` a real alternative to running `moramba-payment-agent-mcp` as a

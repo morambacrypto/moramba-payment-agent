@@ -162,6 +162,16 @@ def pay_agent(receiving_agent_id: str, amount: str, token: str | None = None) ->
 
 
 @mcp.tool()
+def pay_payin(payin_id: str) -> dict:
+    """Pay an existing payin directly by its payin_id — no button, no
+    checkout session, no mandate. Amount, token and recipient all come
+    from Moramba's own payrequest/init lookup for this payin_id — there
+    is nothing else to specify."""
+    record = _get_agent().pay_via_payin_id(payin_id=payin_id)
+    return _record_to_dict(record)
+
+
+@mcp.tool()
 def check_spend_limits(recipient: str, token: str, amount: str, rail: str) -> dict:
     """Dry run a spend-limit check without paying anything — the same
     check a real payment on `rail` would go through."""
