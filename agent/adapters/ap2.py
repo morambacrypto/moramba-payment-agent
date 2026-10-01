@@ -536,6 +536,9 @@ class Ap2SettlementResult:
     flow: str | None
     payin_id: str | None = None
     error: str | None = None
+    # From the payin's own init response — only known once that call
+    # succeeded, so None for a failure before that point.
+    chain_id: int | None = None
 
 
 def settle_autonomous_checkout(
@@ -555,10 +558,12 @@ def settle_autonomous_checkout(
     settlement, then complete the session."""
     payin_id: str | None = None
     flow: str | None = None
+    chain_id: int | None = None
     try:
         authorize_autonomous(base_url, api_key, session, agent_id, wallet)
         payin_id = start_checkout_payment(base_url, api_key, session.session_id)
         init = fetch_payrequest_init(base_url, wallet.address, payin_id)
+        chain_id = init.chain_id
 
         w3 = Web3(Web3.HTTPProvider(init.rpc))
         flow = detect_flow(w3, init.token_address)
@@ -571,7 +576,7 @@ def settle_autonomous_checkout(
         if final_status.get("status") != "success":
             return Ap2SettlementResult(
                 success=False, tx_hash=final_status.get("tx_hash"), flow=flow, payin_id=payin_id,
-                error=final_status.get("error_message") or "settlement failed on-chain",
+                error=final_status.get("error_message") or "settlement failed on-chain", chain_id=chain_id,
             )
 
         try:
@@ -584,7 +589,9 @@ def settle_autonomous_checkout(
             # payment as "Failed" in the ledger and Moramba's history.
             if "already completed" not in str(exc):
                 raise
-        return Ap2SettlementResult(success=True, tx_hash=final_status.get("tx_hash"), flow=flow, payin_id=payin_id)
+        return Ap2SettlementResult(
+            success=True, tx_hash=final_status.get("tx_hash"), flow=flow, payin_id=payin_id, chain_id=chain_id
+        )
     except Ap2Error as exc:
         # Preserve whatever we already knew — a payin may well have been
         # created, and a flow chosen, before this failed; discarding them
@@ -592,4 +599,6 @@ def settle_autonomous_checkout(
         # failure (e.g. a real approve() already sent on-chain for a
         # payin that never got to settle — see pay_button.py's identical
         # fix for the same pattern).
-        return Ap2SettlementResult(success=False, tx_hash=None, flow=flow, payin_id=payin_id, error=str(exc))
+        return Ap2SettlementResult(
+            success=False, tx_hash=None, flow=flow, payin_id=payin_id, error=str(exc), chain_id=chain_id
+        )

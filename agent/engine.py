@@ -368,7 +368,7 @@ class Agent:
         record = self.ledger.record(
             rail="ap2", recipient=recipient, token=session.currency, amount=amount,
             status=STATUS_SETTLED if result.success else STATUS_FAILED,
-            tx_hash=result.tx_hash, reason=result.error,
+            tx_hash=result.tx_hash, reason=result.error, chain_id=result.chain_id,
             raw_request={"session_id": session.session_id, "flow": result.flow}, raw_response=session.raw,
         )
         self._sync_client.sync_pending(self.ledger)
