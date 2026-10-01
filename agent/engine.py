@@ -7,7 +7,7 @@ them re-implement the limit check.
 
 from decimal import Decimal
 
-from agent.adapters import ap2, erc20, mpp, pay_button as pay_button_adapter, x402
+from agent.adapters import ap2, erc20, mpp, pay_button as pay_button_adapter, payin as payin_adapter, x402
 from agent.adapters.ap2 import Ap2Error
 from agent.config import Settings
 from agent.ledger import STATUS_FAILED, STATUS_REJECTED, STATUS_SETTLED, Ledger, PaymentRecord
@@ -453,6 +453,44 @@ class Agent:
                 "button_id": button_id, "network": plan.method.network,
                 "flow": result.flow, "payin_id": result.payin_id,
             },
+        )
+        self._sync_client.sync_pending(self.ledger)
+        return record
+
+    def pay_via_payin_id(self, *, payin_id: str) -> PaymentRecord:
+        """Pay an existing payin directly by its `payin_id` — no button,
+        no ACP checkout session, no mandate. The amount/token/recipient
+        come from Moramba's own `payrequest/init` lookup (read-only, no
+        side effect) — this rail never creates the payin itself, since
+        the caller already has one from somewhere else (a dashboard,
+        another system, a human). Still subject to the same local limit
+        check and token allow-list as every other rail."""
+        try:
+            plan = payin_adapter.resolve_payin(self._settings.moramba_api_base_url, payin_id, self.wallet)
+        except payin_adapter.Ap2Error as exc:
+            return self.ledger.record(
+                rail="payin", recipient=payin_id, token="unknown", amount=Decimal("0"),
+                status=STATUS_REJECTED, reason=str(exc),
+            )
+
+        recipient = plan.init.to
+        token = plan.init.token_name or "unknown"
+
+        check = self.check_spend_limits(recipient=recipient, token=token, amount=plan.amount, rail="payin")
+        if not check.allowed:
+            return self.ledger.record(
+                rail="payin", recipient=recipient, token=token, amount=plan.amount,
+                status=STATUS_REJECTED, reason=check.reason,
+                raw_request={"payin_id": payin_id},
+            )
+
+        result = payin_adapter.pay_payin(self._settings.moramba_api_base_url, payin_id, plan, self.wallet)
+        record = self.ledger.record(
+            rail="payin", recipient=recipient, token=token, amount=plan.amount,
+            chain_id=plan.init.chain_id,
+            status=STATUS_SETTLED if result.success else STATUS_FAILED,
+            tx_hash=result.tx_hash, reason=result.error,
+            raw_request={"payin_id": payin_id, "flow": result.flow},
         )
         self._sync_client.sync_pending(self.ledger)
         return record

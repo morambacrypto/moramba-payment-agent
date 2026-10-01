@@ -1,10 +1,11 @@
 # Moramba Payment Agent
 
-**Status: All planned phases implemented, now six rails — MPP, ERC20,
-x402, AP2 (Autonomous), Moramba Pay Button, and Agent Transfer (pay any
-Moramba agent directly by id) — plus the local ledger, the live limit
-check, a FastAPI service wrapper, the setup wizard, and the MCP tool
-server, all with a passing test suite (156 tests). Packaged as a proper
+**Status: All planned phases implemented, now seven rails — MPP, ERC20,
+x402, AP2 (Autonomous), Moramba Pay Button, Agent Transfer (pay any
+Moramba agent directly by id), and Payin (pay an existing payin_id
+directly) — plus the local ledger, the live limit check, a FastAPI
+service wrapper, the setup wizard, and the MCP tool server, all with a
+passing test suite (167 tests). Packaged as a proper
 pip-installable project (`pyproject.toml`) so a partner can
 `pip install -e .` instead of running from source on `PYTHONPATH`; Docker
 packaging was dropped — not needed for this project. The setup wizard now
@@ -35,7 +36,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 156 tests, all passing
+python -m pytest -q          # 167 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -238,8 +239,8 @@ Three ways to run the same core engine (all share one Python package):
 | Surface | Who uses it | Example |
 |---|---|---|
 | **Library** | a developer embedding payment logic in their own Python app | `from moramba_payment_agent import Agent` |
-| **FastAPI service** | a partner's own backend calling it over HTTP, on their own network | all under `/payment-agent-api`: `POST pay/mpp`, `POST pay/x402`, `POST pay/ap2`, `POST pay/button`, `POST pay/agent`, `POST transfer`, `POST limits/check`, `GET payments`, `GET health` |
-| **MCP tool server** | any MCP-compatible AI chat client (Claude Desktop, ChatGPT) | tools: `pay_via_ap2`, `pay_via_x402`, `pay_via_mpp`, `pay_via_pay_button`, `pay_agent`, `transfer_erc20`, `check_spend_limits`, `list_payments` — served at `/mcp` on the FastAPI service's own port (or standalone via `moramba-payment-agent-mcp`) |
+| **FastAPI service** | a partner's own backend calling it over HTTP, on their own network | all under `/payment-agent-api`: `POST pay/mpp`, `POST pay/x402`, `POST pay/ap2`, `POST pay/button`, `POST pay/agent`, `POST pay/payin`, `POST transfer`, `POST limits/check`, `GET payments`, `GET health` |
+| **MCP tool server** | any MCP-compatible AI chat client (Claude Desktop, ChatGPT) | tools: `pay_via_ap2`, `pay_via_x402`, `pay_via_mpp`, `pay_via_pay_button`, `pay_agent`, `pay_payin`, `transfer_erc20`, `check_spend_limits`, `list_payments` — served at `/mcp` on the FastAPI service's own port (or standalone via `moramba-payment-agent-mcp`) |
 
 ## 4. Supported payment rails
 
@@ -476,6 +477,26 @@ Getting there surfaced three real bugs, none of them hypothetical:
    server-side (and, for the `permit2`/`plain` flows, that a real
    on-chain `approve()` may have already gone out) when the final relay
    call is what actually fails.
+
+### Payin — pay an existing `payin_id` directly
+A sixth rail, and the simplest one: no button, no ACP checkout session,
+no mandate — just a `payin_id` the caller already has (created by
+Moramba's own dashboard/backend, by a different system entirely, or by a
+human), with no token/amount/network to specify at all, since the payin
+already carries all three. No new backend endpoint was needed:
+`GET /morambacrypto/public/payrequest/init/{payin_id}/address/{wallet}`
+is the exact same read-only lookup every other rail already calls as
+its *second* phase (after creating its own payin) — this rail is purely
+that second phase on its own, reusing `agent/adapters/ap2.py`'s
+settlement pipeline (`detect_flow`, the capability-based signing
+builders, `submit_relay_payment`, `poll_payment_status`) as-is via a new
+`agent/adapters/payin.py`. The one piece that lookup doesn't return is
+the token's decimals (needed to convert its minor-units `amount` into
+human units for the limit check) — read live from the token contract
+itself, the same `decimals()` call `erc20.py` already makes for the
+plain ERC20 rail. Still subject to the same local limit check and token
+allow-list as every other rail: a `payin_id` for a token this agent
+isn't configured for is rejected before anything is signed.
 
 ### Plain ERC20 transfer
 The fallback rail: no counterparty protocol, just a direct on-chain
