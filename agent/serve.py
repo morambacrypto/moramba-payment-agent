@@ -28,18 +28,33 @@ public `https://*.trycloudflare.com` URL in seconds, with Cloudflare's
 own real, trusted certificate (terminated at their edge). The
 trade-off: quick-tunnel URLs are random and change every restart, not a
 stable address — acceptable for testing from Claude's web app, not a
-permanent production endpoint. Requires the `cloudflared` binary on
-PATH; prints install instructions and continues serving locally (for
-Claude Code, which has no such restriction) if it isn't found.
+permanent production endpoint.
+
+No manual install step: if `cloudflared` isn't already on PATH, the
+binary for this platform/architecture is downloaded once from
+Cloudflare's own official GitHub releases and cached under
+`~/.cache/moramba-payment-agent/` (not re-fetched on later runs) —
+`pip install` plus `TUNNEL=1 moramba-payment-agent-serve` is the whole
+setup. Only falls back to printing manual install instructions (and
+still serves locally — Claude Code has no such restriction) when
+there's no prebuilt release for this platform/arch, or the download
+itself fails (e.g. no network).
 """
 
 import os
+import platform
 import re
+import shutil
 import signal
 import socket
+import stat
 import subprocess
+import tarfile
+import tempfile
 import threading
 import time
+import urllib.request
+from pathlib import Path
 
 import uvicorn
 
@@ -48,6 +63,8 @@ _PREFERRED_PORT = 58417
 _PID_FILE = ".moramba_payment_agent.pid"
 _STOP_TIMEOUT_SECONDS = 5.0
 _TRYCLOUDFLARE_URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+_CLOUDFLARED_CACHE_DIR = Path.home() / ".cache" / "moramba-payment-agent"
+_CLOUDFLARED_RELEASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}"
 
 
 def find_free_port(host: str = _DEFAULT_HOST) -> int:
@@ -144,24 +161,98 @@ def _watch_tunnel_output(process: subprocess.Popen) -> None:
             return
 
 
+def _cloudflared_release_asset() -> tuple[str, bool] | None:
+    """Returns (asset filename, is_tarball) for this platform/arch, as
+    named in cloudflared's GitHub releases — or `None` if there's no
+    prebuilt release for it. Linux/Windows assets are raw executables;
+    macOS ships as a .tgz containing one."""
+    system = platform.system()
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        arch = "amd64"
+    elif machine in ("aarch64", "arm64"):
+        arch = "arm64"
+    else:
+        return None
+
+    if system == "Linux":
+        return f"cloudflared-linux-{arch}", False
+    if system == "Darwin":
+        return f"cloudflared-darwin-{arch}.tgz", True
+    if system == "Windows" and arch == "amd64":
+        return "cloudflared-windows-amd64.exe", False
+    return None
+
+
+def _download_cloudflared() -> str | None:
+    """Downloads cloudflared for this platform from its official GitHub
+    releases into _CLOUDFLARED_CACHE_DIR, so TUNNEL=1 needs no manual
+    install step. Cached after the first download, not re-fetched on
+    later runs. Returns the cached executable's path, or `None` if this
+    platform/arch has no prebuilt release or the download fails (e.g. no
+    network) — callers fall back to printing manual install instructions
+    either way, never to failing the whole command."""
+    asset = _cloudflared_release_asset()
+    if asset is None:
+        return None
+    asset_name, is_tarball = asset
+
+    exe_name = "cloudflared.exe" if platform.system() == "Windows" else "cloudflared"
+    cached_path = _CLOUDFLARED_CACHE_DIR / exe_name
+    if cached_path.exists():
+        return str(cached_path)
+
+    print(f"TUNNEL=1: downloading cloudflared for this platform (one-time, cached under {_CLOUDFLARED_CACHE_DIR})...")
+    try:
+        _CLOUDFLARED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            downloaded_path = Path(tmp_dir) / asset_name
+            urllib.request.urlretrieve(_CLOUDFLARED_RELEASE_URL.format(asset=asset_name), downloaded_path)
+            if is_tarball:
+                with tarfile.open(downloaded_path) as tar:
+                    tar.extractall(tmp_dir, filter="data")
+                (Path(tmp_dir) / "cloudflared").rename(cached_path)
+            else:
+                downloaded_path.rename(cached_path)
+    except Exception as exc:  # noqa: BLE001 - any download/extract failure falls back to manual install
+        print(f"TUNNEL=1: couldn't download cloudflared automatically ({exc}).")
+        return None
+
+    if platform.system() != "Windows":
+        cached_path.chmod(cached_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return str(cached_path)
+
+
+def _resolve_cloudflared_path() -> str | None:
+    """Prefers an already-installed `cloudflared` on PATH over the
+    auto-downloaded/cached one, so a partner who already has it (or
+    wants a specific version) isn't overridden."""
+    return shutil.which("cloudflared") or _download_cloudflared()
+
+
 def _start_quick_tunnel(host: str, port: int) -> subprocess.Popen | None:
     """Launches a Cloudflare "quick tunnel" forwarding to this local
     server — see the module docstring for why this is what Claude's web
-    app actually needs. Returns `None` without raising if `cloudflared`
-    isn't installed, since the local service is still fully usable (for
-    Claude Code) either way."""
+    app actually needs. Returns `None` without raising if cloudflared
+    isn't available and couldn't be downloaded, since the local service
+    is still fully usable (for Claude Code) either way."""
+    cloudflared_path = _resolve_cloudflared_path()
+    if cloudflared_path is None:
+        print(
+            "TUNNEL=1 was set, but cloudflared isn't available for this platform and "
+            "couldn't be downloaded automatically — serving locally only. Install it "
+            "yourself from https://developers.cloudflare.com/cloudflare-one/connections/"
+            "connect-networks/downloads/ and re-run to get a public URL."
+        )
+        return None
+
     try:
         process = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", f"http://{host}:{port}"],
+            [cloudflared_path, "tunnel", "--url", f"http://{host}:{port}"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
-    except FileNotFoundError:
-        print(
-            "TUNNEL=1 was set, but `cloudflared` isn't installed (or not on PATH) — "
-            "serving locally only. Install it from "
-            "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ "
-            "and re-run to get a public URL."
-        )
+    except OSError as exc:
+        print(f"TUNNEL=1: failed to start cloudflared ({exc}) — serving locally only.")
         return None
 
     threading.Thread(target=_watch_tunnel_output, args=(process,), daemon=True).start()

@@ -1,6 +1,8 @@
 import os
 import signal
 import socket
+import tarfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from agent import serve
@@ -250,28 +252,160 @@ def test_watch_tunnel_output_returns_quietly_when_no_url_appears(capsys):
     assert "trycloudflare.com" not in capsys.readouterr().out
 
 
-def test_start_quick_tunnel_returns_none_when_cloudflared_is_missing(capsys):
-    with patch.object(serve.subprocess, "Popen", side_effect=FileNotFoundError):
+def test_start_quick_tunnel_returns_none_when_cloudflared_unavailable(capsys):
+    with patch.object(serve, "_resolve_cloudflared_path", return_value=None):
         result = serve._start_quick_tunnel("127.0.0.1", 58417)
 
     assert result is None
     assert "cloudflared" in capsys.readouterr().out.lower()
 
 
-def test_start_quick_tunnel_launches_cloudflared_with_the_right_url():
+def test_start_quick_tunnel_returns_none_when_popen_fails(capsys):
+    with patch.object(serve, "_resolve_cloudflared_path", return_value="/path/to/cloudflared"), \
+         patch.object(serve.subprocess, "Popen", side_effect=OSError("permission denied")):
+        result = serve._start_quick_tunnel("127.0.0.1", 58417)
+
+    assert result is None
+    assert "cloudflared" in capsys.readouterr().out.lower()
+
+
+def test_start_quick_tunnel_launches_the_resolved_cloudflared_with_the_right_url():
     fake_process = MagicMock()
     fake_process.stdout = iter([])
-    with patch.object(serve.subprocess, "Popen", return_value=fake_process) as mock_popen, \
+    with patch.object(serve, "_resolve_cloudflared_path", return_value="/path/to/cloudflared"), \
+         patch.object(serve.subprocess, "Popen", return_value=fake_process) as mock_popen, \
          patch.object(serve.threading, "Thread") as mock_thread:
         result = serve._start_quick_tunnel("127.0.0.1", 58417)
 
     assert result is fake_process
     mock_popen.assert_called_once_with(
-        ["cloudflared", "tunnel", "--url", "http://127.0.0.1:58417"],
+        ["/path/to/cloudflared", "tunnel", "--url", "http://127.0.0.1:58417"],
         stdout=serve.subprocess.PIPE, stderr=serve.subprocess.STDOUT, text=True, bufsize=1,
     )
     mock_thread.assert_called_once()
     assert mock_thread.call_args.kwargs.get("daemon") is True
+
+
+def test_resolve_cloudflared_path_prefers_path_over_download():
+    with patch.object(serve.shutil, "which", return_value="/usr/bin/cloudflared"), \
+         patch.object(serve, "_download_cloudflared") as mock_download:
+        result = serve._resolve_cloudflared_path()
+
+    assert result == "/usr/bin/cloudflared"
+    mock_download.assert_not_called()
+
+
+def test_resolve_cloudflared_path_falls_back_to_download_when_not_on_path():
+    with patch.object(serve.shutil, "which", return_value=None), \
+         patch.object(serve, "_download_cloudflared", return_value="/cached/cloudflared") as mock_download:
+        result = serve._resolve_cloudflared_path()
+
+    assert result == "/cached/cloudflared"
+    mock_download.assert_called_once()
+
+
+def test_cloudflared_release_asset_linux_amd64(monkeypatch):
+    monkeypatch.setattr(serve.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(serve.platform, "machine", lambda: "x86_64")
+    assert serve._cloudflared_release_asset() == ("cloudflared-linux-amd64", False)
+
+
+def test_cloudflared_release_asset_linux_arm64(monkeypatch):
+    monkeypatch.setattr(serve.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(serve.platform, "machine", lambda: "aarch64")
+    assert serve._cloudflared_release_asset() == ("cloudflared-linux-arm64", False)
+
+
+def test_cloudflared_release_asset_macos_arm64_is_a_tarball(monkeypatch):
+    monkeypatch.setattr(serve.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(serve.platform, "machine", lambda: "arm64")
+    assert serve._cloudflared_release_asset() == ("cloudflared-darwin-arm64.tgz", True)
+
+
+def test_cloudflared_release_asset_windows_amd64(monkeypatch):
+    monkeypatch.setattr(serve.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(serve.platform, "machine", lambda: "AMD64")
+    assert serve._cloudflared_release_asset() == ("cloudflared-windows-amd64.exe", False)
+
+
+def test_cloudflared_release_asset_none_for_unknown_arch(monkeypatch):
+    monkeypatch.setattr(serve.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(serve.platform, "machine", lambda: "riscv64")
+    assert serve._cloudflared_release_asset() is None
+
+
+def test_cloudflared_release_asset_none_for_windows_arm(monkeypatch):
+    monkeypatch.setattr(serve.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(serve.platform, "machine", lambda: "arm64")
+    assert serve._cloudflared_release_asset() is None
+
+
+def test_download_cloudflared_returns_none_for_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(serve, "_cloudflared_release_asset", lambda: None)
+    assert serve._download_cloudflared() is None
+
+
+def test_download_cloudflared_returns_cached_path_without_redownloading(tmp_path, monkeypatch):
+    monkeypatch.setattr(serve, "_CLOUDFLARED_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(serve.platform, "system", lambda: "Linux")
+    cached = tmp_path / "cloudflared"
+    cached.write_bytes(b"already here")
+
+    with patch.object(serve.urllib.request, "urlretrieve") as mock_fetch:
+        result = serve._download_cloudflared()
+
+    assert result == str(cached)
+    mock_fetch.assert_not_called()
+
+
+def test_download_cloudflared_fetches_a_raw_binary_for_linux(tmp_path, monkeypatch):
+    monkeypatch.setattr(serve, "_CLOUDFLARED_CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(serve.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(serve.platform, "machine", lambda: "x86_64")
+
+    def fake_urlretrieve(url, dest):
+        assert url.endswith("cloudflared-linux-amd64")
+        Path(dest).write_bytes(b"fake binary contents")
+
+    with patch.object(serve.urllib.request, "urlretrieve", side_effect=fake_urlretrieve):
+        result = serve._download_cloudflared()
+
+    assert result == str(tmp_path / "cache" / "cloudflared")
+    assert Path(result).read_bytes() == b"fake binary contents"
+    assert os.access(result, os.X_OK)
+
+
+def test_download_cloudflared_extracts_a_tarball_for_macos(tmp_path, monkeypatch):
+    monkeypatch.setattr(serve, "_CLOUDFLARED_CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(serve.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(serve.platform, "machine", lambda: "arm64")
+
+    def fake_urlretrieve(url, dest):
+        assert url.endswith("cloudflared-darwin-arm64.tgz")
+        inner_dir = Path(dest).parent / "_inner"
+        inner_dir.mkdir()
+        binary_path = inner_dir / "cloudflared"
+        binary_path.write_bytes(b"fake macos binary")
+        with tarfile.open(dest, "w:gz") as tar:
+            tar.add(binary_path, arcname="cloudflared")
+
+    with patch.object(serve.urllib.request, "urlretrieve", side_effect=fake_urlretrieve):
+        result = serve._download_cloudflared()
+
+    assert result == str(tmp_path / "cache" / "cloudflared")
+    assert Path(result).read_bytes() == b"fake macos binary"
+
+
+def test_download_cloudflared_returns_none_and_prints_on_network_failure(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(serve, "_CLOUDFLARED_CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(serve.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(serve.platform, "machine", lambda: "x86_64")
+
+    with patch.object(serve.urllib.request, "urlretrieve", side_effect=OSError("no network")):
+        result = serve._download_cloudflared()
+
+    assert result is None
+    assert "couldn't download" in capsys.readouterr().out.lower()
 
 
 def test_main_does_not_start_a_tunnel_without_tunnel_env_var(tmp_path, monkeypatch):
