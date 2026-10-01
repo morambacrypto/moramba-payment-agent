@@ -2,6 +2,7 @@ import os
 import signal
 import socket
 import tarfile
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -239,8 +240,10 @@ def test_watch_tunnel_output_prints_the_trycloudflare_url(capsys):
         "this line is never reached\n",
     ])
 
-    serve._watch_tunnel_output(fake_process)
+    url_ready = threading.Event()
+    serve._watch_tunnel_output(fake_process, url_ready)
 
+    assert url_ready.is_set()
     assert "https://random-words-here.trycloudflare.com/mcp" in capsys.readouterr().out
 
 
@@ -248,9 +251,44 @@ def test_watch_tunnel_output_returns_quietly_when_no_url_appears(capsys):
     fake_process = MagicMock()
     fake_process.stdout = iter(["no url in this output\n"])
 
-    serve._watch_tunnel_output(fake_process)  # must not raise
+    url_ready = threading.Event()
+    serve._watch_tunnel_output(fake_process, url_ready)  # must not raise
+
+    assert not url_ready.is_set()
 
     assert "trycloudflare.com" not in capsys.readouterr().out
+
+
+def test_announce_tunnel_pending_prints_once_uvicorn_is_listening_and_url_not_ready(capsys):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+
+        serve._announce_tunnel_pending("127.0.0.1", port, threading.Event())
+
+    assert "Creating the Cloudflare tunnel" in capsys.readouterr().out
+
+
+def test_announce_tunnel_pending_stays_quiet_if_the_url_already_printed(capsys):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        already_ready = threading.Event()
+        already_ready.set()
+
+        serve._announce_tunnel_pending("127.0.0.1", port, already_ready)
+
+    assert "Creating the Cloudflare tunnel" not in capsys.readouterr().out
+
+
+def test_announce_tunnel_pending_gives_up_quietly_if_nothing_ever_listens(capsys):
+    free_port = serve.find_free_port()  # nothing is listening on it
+
+    serve._announce_tunnel_pending("127.0.0.1", free_port, threading.Event(), wait_seconds=0.3)
+
+    assert "Creating the Cloudflare tunnel" not in capsys.readouterr().out
 
 
 def test_start_quick_tunnel_returns_none_when_cloudflared_unavailable(capsys):
@@ -286,8 +324,11 @@ def test_start_quick_tunnel_launches_the_resolved_cloudflared_with_the_right_url
         ],
         stdout=serve.subprocess.PIPE, stderr=serve.subprocess.STDOUT, text=True, bufsize=1,
     )
-    mock_thread.assert_called_once()
-    assert mock_thread.call_args.kwargs.get("daemon") is True
+    # One thread watches cloudflared's output for the public URL, the
+    # other prints the "tunnel is being created" note — both daemons, so
+    # neither can keep the process alive after uvicorn exits.
+    assert mock_thread.call_count == 2
+    assert all(call.kwargs.get("daemon") is True for call in mock_thread.call_args_list)
 
 
 def test_resolve_cloudflared_path_prefers_path_over_download():
