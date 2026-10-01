@@ -24,12 +24,16 @@ class Settings(BaseSettings):
     db_path: str = "moramba_payment_agent.db"
 
     # Shared secret required on every request to this process's HTTP/MCP
-    # server (`Authorization: Bearer <api_key>`) — generated once by the
-    # setup wizard. Left unset, the server runs with no request auth at
-    # all: fine for a purely local connection, but never safe to combine
-    # with TUNNEL=1, since anyone with that public URL could otherwise
-    # call every pay_* route directly.
-    api_key: str | None = None
+    # server (`Authorization: Bearer <payment_agent_api_key>`) — generated
+    # once by the setup wizard (32 random bytes, url-safe encoded).
+    # Prefixed PAYMENT_AGENT_, not AGENT_: this is THIS running service's
+    # own transport key, unrelated to a Moramba `agents` row's id or to
+    # MORAMBA_ACP_API_KEY (which authenticates this agent *to* Moramba,
+    # the opposite direction). Required, not optional: without it, every
+    # request is rejected (see `require_api_key` in agent/api.py) rather
+    # than the server silently running open — a partner must never be
+    # able to combine TUNNEL=1's public URL with no auth at all.
+    payment_agent_api_key: str
 
     # ERC20 token contract used by the `transfer_erc20` rail when a token
     # symbol isn't resolvable through Moramba's own token list. Optional —

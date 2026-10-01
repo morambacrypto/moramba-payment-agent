@@ -68,14 +68,14 @@ def test_build_env_content_shape():
             "moramba_api_base_url": BASE_URL, "moramba_acp_api_key": "acp-key-123",
             "chain_id": 42431, "rpc_url": "https://rpc.example",
             "db_path": "a.db", "default_token_contract": "0x" + "11" * 20,
-            "api_key": "test-api-key-xyz",
+            "payment_agent_api_key": "test-api-key-xyz",
         }
     )
     assert f"WALLET_PRIVATE_KEY={TEST_PRIVATE_KEY}" in content
     assert f"MORAMBA_AGENT_ID={AGENT_ID}" in content
     assert "MORAMBA_ACP_API_KEY=acp-key-123" in content
     assert "RPC_URL=https://rpc.example" in content
-    assert "AGENT_API_KEY=test-api-key-xyz" in content
+    assert "PAYMENT_AGENT_API_KEY=test-api-key-xyz" in content
 
 
 @respx.mock
@@ -138,8 +138,8 @@ def test_run_wizard_happy_path_auto_detects_network(tmp_path):
     assert "DEFAULT_TOKEN_CONTRACT=0x20c0000000000000000000000000000000000000" in content
     assert oct(env_path.stat().st_mode)[-3:] == "600"
 
-    api_key_line = next(line for line in content.splitlines() if line.startswith("AGENT_API_KEY="))
-    assert len(api_key_line.removeprefix("AGENT_API_KEY=")) > 20  # a real generated secret, not blank
+    api_key_line = next(line for line in content.splitlines() if line.startswith("PAYMENT_AGENT_API_KEY="))
+    assert len(api_key_line.removeprefix("PAYMENT_AGENT_API_KEY=")) > 20  # a real generated secret, not blank
 
 
 @respx.mock

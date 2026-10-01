@@ -35,10 +35,11 @@ logger = logging.getLogger("agent.api")
 
 _agent: Agent | None = None
 
-# Set from Settings().api_key at lifespan startup (see `lifespan` below).
-# None means the service is running with no request authentication at
-# all — the setup wizard always generates one, so this is only ever None
-# for a pre-existing .env from before this field existed.
+# Set from Settings().payment_agent_api_key at lifespan startup (see
+# `lifespan` below). It's a required Settings field, so this is only
+# ever None when .env is missing PAYMENT_AGENT_API_KEY entirely or
+# failed to load for some other reason — `require_api_key` below treats
+# that as "reject everything," not "skip the check."
 _api_key: str | None = None
 
 # Every route below is `def`, not `async def` — every rail (mpp/erc20/
@@ -91,16 +92,16 @@ async def lifespan(app: FastAPI):
         try:
             settings = Settings()
             _agent = Agent(settings)
-            _api_key = settings.api_key
+            _api_key = settings.payment_agent_api_key
         except Exception as exc:  # noqa: BLE001 - a misconfigured .env shouldn't crash-loop the service
             logger.error("failed to initialize Agent from Settings(): %s", exc)
             _agent = None
             _api_key = None
         if not _api_key:
-            logger.warning(
-                "AGENT_API_KEY not set — this service is accepting requests with no "
-                "authentication at all. Safe only if nothing but this process can "
-                "reach its port; never combine with TUNNEL=1 like this."
+            logger.error(
+                "PAYMENT_AGENT_API_KEY not set (or .env failed to load) — every "
+                "request to this service will be rejected with 401 until it's set. "
+                "Run moramba-payment-agent-setup to generate one."
             )
         mcp_server._agent = _agent
         try:
@@ -129,12 +130,16 @@ async def require_api_key(request: Request, call_next):
     spliced directly into `app.router.routes` in `lifespan`, not mounted
     as a sub-app) — middleware wraps the whole ASGI app regardless of how
     a route was registered, so this is the one place that covers both
-    surfaces. A no-op when `_api_key` is unset (see its definition above)."""
-    if _api_key:
-        expected = f"Bearer {_api_key}"
-        got = request.headers.get("authorization", "")
-        if not hmac.compare_digest(got, expected):
-            return JSONResponse({"detail": "missing or invalid API key"}, status_code=401)
+    surfaces. Deliberately deny-by-default, not fail-open: an unset
+    `_api_key` (missing PAYMENT_AGENT_API_KEY, or a .env that failed to load at
+    all) must mean nothing gets in, not that auth silently stops being
+    checked — this is the one thing standing between "I have this
+    service's URL" and "I can call its payment routes" once TUNNEL=1
+    makes that URL public."""
+    expected = f"Bearer {_api_key}" if _api_key else None
+    got = request.headers.get("authorization", "")
+    if not expected or not hmac.compare_digest(got, expected):
+        return JSONResponse({"detail": "missing or invalid API key"}, status_code=401)
     return await call_next(request)
 
 

@@ -34,6 +34,7 @@ def make_agent(tmp_path) -> Agent:
         chain_id=42431,
         rpc_url="https://tempo-testnet.example",
         db_path=str(tmp_path / "agent.db"),
+        payment_agent_api_key="test-agent-api-key",
     )
     return Agent(settings)
 
