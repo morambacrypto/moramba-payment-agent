@@ -122,11 +122,32 @@ def resolve_payment_plan(
     *,
     network: str | None = None,
     amount: Decimal | None = None,
+    preferred_tokens: list[str] | None = None,
+    preferred_network_hint: str | None = None,
     timeout: float = 20.0,
 ) -> ButtonPaymentPlan:
-    """Scrapes the button's details and picks a payout method (the one
-    matching `network` if given, else the first configured), resolving
-    the amount to charge without ever creating a payin."""
+    """Scrapes the button's details and picks a payout method, resolving
+    the amount to charge without ever creating a payin.
+
+    Method selection: `network` wins outright if given (unambiguous — a
+    button has at most one method per network). Otherwise, prefer a
+    method whose token is in `preferred_tokens` (case-insensitive) —
+    normally the paying agent's own `allowed_tokens`, so a multi-token
+    button doesn't get paid in whichever token happens to be listed
+    first if that one isn't actually one this agent can spend (found
+    live, 2026-10-01: a button accepting both USDC and pathUSD picked
+    USDC — index 0 — for an agent only configured for pathUSD, and was
+    rejected, even though the button also had a pathUSD method).
+
+    When more than one method matches `preferred_tokens` (the same token
+    offered on more than one network — e.g. pathUSD on both testnet and
+    mainnet), `preferred_network_hint` (a substring like `"testnet"` or
+    `"mainnet"`, derived from the agent's own configured chain) breaks
+    the tie by matching it against each candidate's `network` string —
+    `ButtonPayoutMethod` doesn't carry a chain id to match on directly,
+    only this network slug, so substring matching is what's available.
+    Without a match on either, falls back to the first configured
+    method, same as before any of this existed."""
     details = fetch_button_details(base_url, button_id, timeout=timeout)
     if not details.payout_methods:
         raise Ap2Error(f"button {button_id} has no payout methods configured")
@@ -137,6 +158,17 @@ def resolve_payment_plan(
         if matching is None:
             raise Ap2Error(f"button {button_id} has no payout method for network {network!r}")
         method = matching
+    elif preferred_tokens:
+        preferred_lower = {t.lower() for t in preferred_tokens}
+        candidates = [m for m in details.payout_methods if m.token_name.lower() in preferred_lower]
+        if candidates:
+            method = candidates[0]
+            if preferred_network_hint and len(candidates) > 1:
+                network_matched = next(
+                    (m for m in candidates if preferred_network_hint.lower() in m.network.lower()), None
+                )
+                if network_matched is not None:
+                    method = network_matched
 
     if details.fixed_amount:
         if not method.amount_with_decimal:
