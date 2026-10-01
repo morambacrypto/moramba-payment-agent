@@ -5,7 +5,7 @@ x402, AP2 (Autonomous), Moramba Pay Button, Agent Transfer (pay any
 Moramba agent directly by id), and Payin (pay an existing payin_id
 directly) — plus the local ledger, the live limit check, a FastAPI
 service wrapper, the setup wizard, and the MCP tool server, all with a
-passing test suite (171 tests). Packaged as a proper
+passing test suite (174 tests). Packaged as a proper
 pip-installable project (`pyproject.toml`) so a partner can
 `pip install -e .` instead of running from source on `PYTHONPATH`; Docker
 packaging was dropped — not needed for this project. The setup wizard now
@@ -36,7 +36,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 171 tests, all passing
+python -m pytest -q          # 174 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -108,15 +108,22 @@ local development. Set `AGENT_THREAD_POOL_SIZE` to raise how many
 payments can be in flight at once — every route is sync, since each
 rail makes blocking httpx/web3 calls, so concurrency comes from a
 thread pool rather than asyncio; the default is 100, well above
-anyio's own default of 40. Set `SSL=1` to serve over HTTPS instead of
-plain HTTP — Claude's web app (unlike Claude Code) only accepts an
-`https://` URL for a remote MCP server, even a local one. A self-signed
-cert for `127.0.0.1`/`localhost` is generated once and cached
-(`.moramba_payment_agent_cert.pem`/`_key.pem`, not regenerated on every
-start) rather than requiring an external `openssl` call or a cert the
-partner has to supply. It's opt-in, not the default, since a self-signed
-cert is untrusted by any browser/client until accepted once — nothing
-about this makes `127.0.0.1` reachable from outside this machine.)
+anyio's own default of 40. Claude's web app's MCP connector calls out
+from Anthropic's own servers, not the browser, so `localhost`/
+`127.0.0.1` can never reach it — "our servers cannot reach your local
+machine" is Claude's own error for this, and no amount of local TLS
+changes that (Claude Code has no such restriction and already works
+against the plain `http://` URL above). Set `TUNNEL=1` to expose this
+server through a free Cloudflare quick tunnel (requires the
+`cloudflared` binary on PATH — if it's missing, install instructions
+are printed and the service still starts normally, serving locally
+only): no account, no domain, no signup, a public
+`https://*.trycloudflare.com` URL within seconds, printed to the
+console once the tunnel connects, with Cloudflare's own real, trusted
+certificate. Live-tested end to end (2026-10-01): a request to the
+public URL reached this local server correctly. The trade-off is the
+URL is random and changes every restart — fine for testing from
+Claude's web app, not a stable, permanent address.)
 
 ```
 curl -X POST localhost:PORT/payment-agent-api/pay/mpp -H "Content-Type: application/json" -d '{

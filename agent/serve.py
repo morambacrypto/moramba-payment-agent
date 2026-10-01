@@ -18,33 +18,36 @@ loudly (an explicit port request should mean that port, not a silent
 substitute), and the preferred-port case falls back to an OS-assigned
 free port instead.
 
-Set `SSL=1` to serve over HTTPS instead of plain HTTP — needed because
-Claude's web app (unlike Claude Code) only accepts an `https://` URL for
-a remote MCP server, even a local one. A self-signed cert for
-127.0.0.1/localhost is generated once and cached (_CERT_FILE/_KEY_FILE),
-not regenerated on every start, since a browser that already trusted a
-previous cert would otherwise need to re-trust a new one each restart.
-It's opt-in, not the default, because a self-signed cert is untrusted by
-default — the browser/client will warn the first time, and nothing
-about this makes 127.0.0.1 reachable from outside this machine.
+Claude's web app's MCP connector calls out from Anthropic's own servers,
+not the browser, so a `localhost`/`127.0.0.1` URL can never reach it —
+"our servers cannot reach your local machine" is Claude's own error for
+this, and no amount of local TLS changes that. Set `TUNNEL=1` to expose
+this local server through a free Cloudflare quick tunnel
+(`cloudflared tunnel --url ...`) — no account, no domain, no signup, a
+public `https://*.trycloudflare.com` URL in seconds, with Cloudflare's
+own real, trusted certificate (terminated at their edge). The
+trade-off: quick-tunnel URLs are random and change every restart, not a
+stable address — acceptable for testing from Claude's web app, not a
+permanent production endpoint. Requires the `cloudflared` binary on
+PATH; prints install instructions and continues serving locally (for
+Claude Code, which has no such restriction) if it isn't found.
 """
 
-import ipaddress
 import os
+import re
 import signal
 import socket
+import subprocess
+import threading
 import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import uvicorn
 
 _DEFAULT_HOST = "127.0.0.1"
 _PREFERRED_PORT = 58417
 _PID_FILE = ".moramba_payment_agent.pid"
-_CERT_FILE = ".moramba_payment_agent_cert.pem"
-_KEY_FILE = ".moramba_payment_agent_key.pem"
 _STOP_TIMEOUT_SECONDS = 5.0
+_TRYCLOUDFLARE_URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 
 
 def find_free_port(host: str = _DEFAULT_HOST) -> int:
@@ -133,55 +136,42 @@ def _resolve_port(host: str, port: int) -> int | None:
     return port if _is_port_free(host, port) else None
 
 
-def _ensure_self_signed_cert(cert_path: str, key_path: str) -> None:
-    """Generates a self-signed TLS cert/key for 127.0.0.1/localhost if
-    one doesn't already exist, so SSL=1 needs neither an external
-    `openssl` call nor a cert the user has to supply themselves. Cached
-    on disk rather than regenerated every start — see the module
-    docstring for why that matters."""
-    if Path(cert_path).exists() and Path(key_path).exists():
-        return
+def _watch_tunnel_output(process: subprocess.Popen) -> None:
+    for line in process.stdout:
+        match = _TRYCLOUDFLARE_URL_RE.search(line)
+        if match:
+            print(f"Public URL (Cloudflare quick tunnel, for Claude's web app): {match.group(0)}")
+            return
 
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
 
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
-    now = datetime.now(timezone.utc)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(days=1))
-        .not_valid_after(now + timedelta(days=3650))
-        .add_extension(
-            x509.SubjectAlternativeName(
-                [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
-            ),
-            critical=False,
+def _start_quick_tunnel(host: str, port: int) -> subprocess.Popen | None:
+    """Launches a Cloudflare "quick tunnel" forwarding to this local
+    server — see the module docstring for why this is what Claude's web
+    app actually needs. Returns `None` without raising if `cloudflared`
+    isn't installed, since the local service is still fully usable (for
+    Claude Code) either way."""
+    try:
+        process = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", f"http://{host}:{port}"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
-        .sign(key, hashes.SHA256())
-    )
-
-    Path(key_path).write_bytes(
-        key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
+    except FileNotFoundError:
+        print(
+            "TUNNEL=1 was set, but `cloudflared` isn't installed (or not on PATH) — "
+            "serving locally only. Install it from "
+            "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ "
+            "and re-run to get a public URL."
         )
-    )
-    Path(cert_path).write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    os.chmod(key_path, 0o600)
+        return None
+
+    threading.Thread(target=_watch_tunnel_output, args=(process,), daemon=True).start()
+    return process
 
 
 def main() -> None:
     host = os.environ.get("HOST", _DEFAULT_HOST)
     pinned_port = os.environ.get("PORT")
-    ssl_enabled = os.environ.get("SSL", "").lower() in ("1", "true", "yes")
+    tunnel_enabled = os.environ.get("TUNNEL", "").lower() in ("1", "true", "yes")
 
     if pinned_port:
         requested = int(pinned_port)
@@ -195,23 +185,16 @@ def main() -> None:
 
     _write_pid_file()
 
-    ssl_kwargs = {}
-    scheme = "http"
-    if ssl_enabled:
-        _ensure_self_signed_cert(_CERT_FILE, _KEY_FILE)
-        ssl_kwargs = {"ssl_certfile": _CERT_FILE, "ssl_keyfile": _KEY_FILE}
-        scheme = "https"
-
-    print(f"Starting moramba-payment-agent on {scheme}://{host}:{port}")
-    if ssl_enabled:
-        print(
-            f"(self-signed cert — your browser/client will warn it's untrusted the first "
-            f"time; accept it once, or trust {_CERT_FILE} in your OS/browser store)"
-        )
+    print(f"Starting moramba-payment-agent on http://{host}:{port}")
     if not pinned_port:
         print(f"(tried preferred port {_PREFERRED_PORT} first, auto-selected otherwise — set PORT to pin a specific one instead)")
 
-    uvicorn.run("agent.api:app", host=host, port=port, **ssl_kwargs)
+    tunnel_process = _start_quick_tunnel(host, port) if tunnel_enabled else None
+    try:
+        uvicorn.run("agent.api:app", host=host, port=port)
+    finally:
+        if tunnel_process is not None:
+            tunnel_process.terminate()
 
 
 if __name__ == "__main__":

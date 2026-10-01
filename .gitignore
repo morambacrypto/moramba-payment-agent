@@ -2,8 +2,6 @@
 *.db
 *.sqlite3
 .moramba_payment_agent.pid
-.moramba_payment_agent_cert.pem
-.moramba_payment_agent_key.pem
 __pycache__/
 *.pyc
 .pytest_cache/
