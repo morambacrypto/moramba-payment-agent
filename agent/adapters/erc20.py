@@ -28,6 +28,13 @@ _ERC20_ABI = [
         "outputs": [{"name": "", "type": "uint8"}],
         "type": "function",
     },
+    {
+        "constant": True,
+        "inputs": [{"name": "owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    },
 ]
 
 
@@ -59,6 +66,22 @@ def pay(
     amount_units = int(amount * (10**decimals))
     to_checksum = Web3.to_checksum_address(to_address)
 
+    # Checked before building/signing anything — a revert for
+    # insufficient balance still costs the gas already spent getting the
+    # transaction mined, so this is strictly cheaper than letting it fail
+    # on-chain, and gives a clear reason instead of an opaque revert.
+    try:
+        token_balance = contract.functions.balanceOf(account.address).call()
+    except Exception as exc:  # noqa: BLE001
+        return PaymentResult(success=False, error=f"could not read token balance: {exc}")
+    if token_balance < amount_units:
+        have = Decimal(token_balance) / (Decimal(10) ** decimals)
+        return PaymentResult(
+            success=False,
+            raw_request={"to": to_address, "amount": str(amount)},
+            error=f"insufficient token balance: have {have}, need {amount}",
+        )
+
     try:
         nonce = w3.eth.get_transaction_count(account.address)
         transfer_call = contract.functions.transfer(to_checksum, amount_units)
@@ -79,13 +102,27 @@ def pay(
                     to_checksum, chain_id, _FALLBACK_GAS_LIMIT, exc,
                 )
                 gas_limit = _FALLBACK_GAS_LIMIT
+
+        gas_price = w3.eth.gas_price
+        native_balance = w3.eth.get_balance(account.address)
+        estimated_gas_cost = gas_limit * gas_price
+        if native_balance < estimated_gas_cost:
+            return PaymentResult(
+                success=False,
+                raw_request={"to": to_address, "amount": str(amount)},
+                error=(
+                    f"insufficient native balance for gas: have {native_balance} wei, "
+                    f"need ~{estimated_gas_cost} wei ({gas_limit} gas @ {gas_price} wei/gas)"
+                ),
+            )
+
         tx = transfer_call.build_transaction(
             {
                 "chainId": chain_id,
                 "from": account.address,
                 "nonce": nonce,
                 "gas": gas_limit,
-                "gasPrice": w3.eth.gas_price,
+                "gasPrice": gas_price,
             }
         )
         signed = account.sign_transaction(tx)

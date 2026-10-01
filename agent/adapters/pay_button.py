@@ -96,7 +96,18 @@ def create_payin_by_button_id(
 ) -> dict[str, Any]:
     """`POST .../payin/create/by/button_id/{button_id}`. `amount` is only
     sent for a variable-amount button — a fixed-amount button ignores
-    any amount sent and uses its own configured one."""
+    any amount sent and uses its own configured one.
+
+    `amount` must already be in the token's own minor units (e.g. "1"
+    pathUSD at 6 decimals is `1000000`), not human units — confirmed from
+    the backend (`payin_user_controller.rs`'s
+    `create_ai_payin_user_by_button_id_controller`): for a variable
+    button it stores `json_data.amount` as the payin's `base_amount`
+    completely unscaled, the exact same way a fixed button's own
+    `amount_with_decimal` (already minor units) is used. The caller
+    (`pay_button`, below) does this conversion — found live (2026-10-01):
+    sending `"1"` for a 1-pathUSD payment settled `0.000001` pathUSD
+    on-chain instead."""
     body: dict[str, Any] = {"network": network, "token_address": token_address}
     if amount is not None:
         body["amount"] = str(amount)
@@ -203,7 +214,10 @@ def pay_button(base_url: str, button_id: str, plan: ButtonPaymentPlan, wallet: W
             button_id,
             plan.method.network,
             plan.method.token_address,
-            amount=None if plan.fixed_amount else plan.amount,
+            # plan.amount is human units (e.g. Decimal("1")); the backend
+            # wants this field in the token's minor units — see
+            # create_payin_by_button_id's docstring for why.
+            amount=None if plan.fixed_amount else plan.amount * (Decimal(10) ** plan.method.decimals),
         )
         payin_id = payin["id"]
 
