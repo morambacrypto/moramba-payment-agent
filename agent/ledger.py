@@ -42,6 +42,9 @@ CREATE INDEX IF NOT EXISTS idx_payments_synced_at ON payments (synced_at);
 STATUS_SETTLED = "settled"
 STATUS_REJECTED = "rejected"
 STATUS_FAILED = "failed"
+# The payment was submitted but its on-chain outcome could not be confirmed
+# (e.g. the settlement poll timed out) — it may well have gone through.
+STATUS_PENDING = "pending"
 
 
 @dataclass(frozen=True)
@@ -182,12 +185,14 @@ class Ledger:
         token: str | None = None,
         recipient: str | None = None,
     ) -> Decimal:
-        """Sum of settled amounts since `since_iso` — the number a limit
+        """Sum of settled (and pending) amounts since `since_iso` — the number a limit
         check compares against. Scoped by `token` when given, since limits
         that mix tokens aren't meaningfully comparable; scoped by
         `recipient` for vendor-wise limit checks."""
-        query = "SELECT amount FROM payments WHERE status = ? AND created_at >= ?"
-        params: list = [STATUS_SETTLED, since_iso]
+        # A pending payment may have settled, so it counts as spent too —
+        # leaving it out would let a retry spend past the limit.
+        query = "SELECT amount FROM payments WHERE status IN (?, ?) AND created_at >= ?"
+        params: list = [STATUS_SETTLED, STATUS_PENDING, since_iso]
         if rail is not None:
             query += " AND rail = ?"
             params.append(rail)
@@ -201,8 +206,8 @@ class Ledger:
         return sum((Decimal(r["amount"]) for r in rows), Decimal("0"))
 
     def count_since(self, since_iso: str, *, rail: str | None = None) -> int:
-        query = "SELECT COUNT(*) AS n FROM payments WHERE status = ? AND created_at >= ?"
-        params: list = [STATUS_SETTLED, since_iso]
+        query = "SELECT COUNT(*) AS n FROM payments WHERE status IN (?, ?) AND created_at >= ?"
+        params: list = [STATUS_SETTLED, STATUS_PENDING, since_iso]
         if rail is not None:
             query += " AND rail = ?"
             params.append(rail)

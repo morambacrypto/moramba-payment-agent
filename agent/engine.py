@@ -11,7 +11,7 @@ from agent import balance
 from agent.adapters import ap2, erc20, mpp, pay_button as pay_button_adapter, payin as payin_adapter, x402
 from agent.adapters.ap2 import Ap2Error
 from agent.config import Settings
-from agent.ledger import STATUS_FAILED, STATUS_REJECTED, STATUS_SETTLED, Ledger, PaymentRecord
+from agent.ledger import STATUS_FAILED, STATUS_PENDING, STATUS_REJECTED, STATUS_SETTLED, Ledger, PaymentRecord
 from agent.limit_check import LimitChecker, LimitCheckResult
 from agent.limits_client import MorambaAgentClient
 from agent.setup import KNOWN_CHAIN_RPCS
@@ -36,6 +36,15 @@ def _network_slug_hint(network_slug: str) -> str | None:
     _CHAIN_NETWORK_HINT's chains it corresponds to."""
     lowered = network_slug.lower()
     return next((hint for hint in _CHAIN_NETWORK_HINT.values() if hint in lowered), None)
+
+
+def _status_of(result) -> str:
+    """Ledger status for a rail's result. `pending` only exists on the
+    relay-settled rails (AP2, pay button, payin) — everything else is a
+    plain success/failure."""
+    if result.success:
+        return STATUS_SETTLED
+    return STATUS_PENDING if getattr(result, "pending", False) else STATUS_FAILED
 
 
 def _parse_caip2_chain_id(network: str) -> int | None:
@@ -126,7 +135,7 @@ class Agent:
         )
         record = self.ledger.record(
             rail="mpp", recipient=recipient, token=token, amount=amount,
-            status=STATUS_SETTLED if result.success else STATUS_FAILED,
+            status=_status_of(result),
             tx_hash=result.tx_hash, signature=result.signature, reason=result.error,
             raw_request=result.raw_request, raw_response=result.raw_response,
         )
@@ -206,7 +215,7 @@ class Agent:
         record = self.ledger.record(
             rail="erc20", recipient=to_address, token=token, amount=amount,
             chain_id=chain_id,
-            status=STATUS_SETTLED if result.success else STATUS_FAILED,
+            status=_status_of(result),
             tx_hash=result.tx_hash, reason=result.error,
             raw_request=result.raw_request, raw_response=result.raw_response,
         )
@@ -285,7 +294,7 @@ class Agent:
         record = self.ledger.record(
             rail="agent_transfer", recipient=to_address, token=resolved_token.token_name, amount=amount,
             chain_id=resolved_token.chain,
-            status=STATUS_SETTLED if result.success else STATUS_FAILED,
+            status=_status_of(result),
             tx_hash=result.tx_hash, reason=result.error,
             receiving_agent_id=receiving_agent_id,
             raw_request=result.raw_request, raw_response=result.raw_response,
@@ -353,7 +362,7 @@ class Agent:
         record = self.ledger.record(
             rail="x402", recipient=req.pay_to, token=token_label, amount=amount,
             chain_id=chain_id,
-            status=STATUS_SETTLED if result.success else STATUS_FAILED,
+            status=_status_of(result),
             tx_hash=result.tx_hash, reason=result.error,
             raw_request=result.raw_request, raw_response=result.raw_response,
         )
@@ -414,7 +423,7 @@ class Agent:
         )
         record = self.ledger.record(
             rail="ap2", recipient=recipient, token=session.currency, amount=amount,
-            status=STATUS_SETTLED if result.success else STATUS_FAILED,
+            status=_status_of(result),
             tx_hash=result.tx_hash, reason=result.error, chain_id=result.chain_id,
             raw_request={"session_id": session.session_id, "flow": result.flow}, raw_response=session.raw,
         )
@@ -498,7 +507,7 @@ class Agent:
         result = pay_button_adapter.pay_button(self._settings.moramba_api_base_url, button_id, plan, self.wallet)
         record = self.ledger.record(
             rail="pay_button", recipient=recipient, token=token, amount=plan.amount,
-            status=STATUS_SETTLED if result.success else STATUS_FAILED,
+            status=_status_of(result),
             tx_hash=result.tx_hash, reason=result.error,
             raw_request={
                 "button_id": button_id, "network": plan.method.network,
@@ -539,7 +548,7 @@ class Agent:
         record = self.ledger.record(
             rail="payin", recipient=recipient, token=token, amount=plan.amount,
             chain_id=plan.init.chain_id,
-            status=STATUS_SETTLED if result.success else STATUS_FAILED,
+            status=_status_of(result),
             tx_hash=result.tx_hash, reason=result.error,
             raw_request={"payin_id": payin_id, "flow": result.flow},
         )

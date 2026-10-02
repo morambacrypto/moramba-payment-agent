@@ -7,7 +7,7 @@ import respx
 from agent.adapters import ap2
 from agent.config import Settings
 from agent.engine import Agent
-from agent.ledger import STATUS_REJECTED, STATUS_SETTLED
+from agent.ledger import STATUS_FAILED, STATUS_PENDING, STATUS_REJECTED, STATUS_SETTLED
 from agent.signing import load_wallet
 
 TEST_PRIVATE_KEY = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
@@ -288,3 +288,60 @@ def test_pay_via_ap2_converts_crypto_denominated_amount_using_sessions_own_decim
     assert record.tx_hash == "0xcoffeetx"
     assert record.amount == Decimal("1.5")
     assert record.chain_id == 42431
+
+
+@respx.mock
+def test_pay_via_ap2_records_pending_not_failed_when_the_outcome_is_unknown(tmp_path):
+    """The payment was submitted but its settlement couldn't be confirmed —
+    it may well have gone through, so it must not read as Failed, and it
+    must keep counting toward the limits so a retry can't overspend."""
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "USD"}])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    session = ap2.CheckoutSession(session_id="sess-1", amount="500", currency="USD", decimals=2, raw={})
+    pending = ap2.Ap2SettlementResult(
+        success=False, tx_hash=None, flow="plain", payin_id="payin-1", chain_id=42431,
+        error="outcome unknown — the payment was submitted but its settlement could not be confirmed (timed out)",
+        pending=True,
+    )
+
+    agent = Agent(settings)
+    try:
+        with patch.object(ap2, "create_checkout_session", return_value=session), \
+             patch.object(ap2, "settle_autonomous_checkout", return_value=pending):
+            record = agent.pay_via_ap2(items=[{"id": "button-1"}], buyer_email="buyer@example.com")
+        spent = agent.ledger.spent_since("1970-01-01T00:00:00+00:00")
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_PENDING
+    assert "outcome unknown" in record.reason
+    assert record.chain_id == 42431
+    assert spent == Decimal("5.00")  # counted, since it may have settled
+
+
+@respx.mock
+def test_pay_via_ap2_still_records_a_plain_failure_as_failed(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "USD"}])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    session = ap2.CheckoutSession(session_id="sess-1", amount="500", currency="USD", decimals=2, raw={})
+    failed = ap2.Ap2SettlementResult(success=False, tx_hash=None, flow="plain", payin_id="payin-1", error="reverted")
+
+    agent = Agent(settings)
+    try:
+        with patch.object(ap2, "create_checkout_session", return_value=session), \
+             patch.object(ap2, "settle_autonomous_checkout", return_value=failed):
+            record = agent.pay_via_ap2(items=[{"id": "button-1"}], buyer_email="buyer@example.com")
+        spent = agent.ledger.spent_since("1970-01-01T00:00:00+00:00")
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_FAILED
+    assert spent == Decimal("0")

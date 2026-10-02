@@ -19,6 +19,7 @@ from agent.adapters.ap2 import (
     Ap2Error,
     PayInit,
     check_wallet_token_balance,
+    classify_settlement_exception,
     detect_flow,
     fetch_payrequest_init,
     poll_payment_status,
@@ -54,6 +55,7 @@ class PayinSettlementResult:
     tx_hash: str | None
     flow: str | None
     error: str | None = None
+    pending: bool = False  # submitted, but its outcome couldn't be confirmed
 
 
 def resolve_payin(base_url: str, payin_id: str, wallet: Wallet) -> PayinPlan:
@@ -78,6 +80,7 @@ def pay_payin(base_url: str, payin_id: str, plan: PayinPlan, wallet: Wallet) -> 
     sign and settle through the exact pipeline AP2/pay_button already
     use."""
     flow: str | None = None
+    submitted = False
     try:
         init = plan.init
         w3 = Web3(Web3.HTTPProvider(init.rpc))
@@ -86,15 +89,18 @@ def pay_payin(base_url: str, payin_id: str, plan: PayinPlan, wallet: Wallet) -> 
         pay_body = _BUILDER_BY_FLOW[flow](w3, wallet._account, init)
 
         submit_relay_payment(base_url, payin_id, init.transaction_id, flow, pay_body)
+        submitted = True
         final_status = poll_payment_status(base_url, init.transaction_id)
+        submitted = False  # an outcome is known from here on, whatever it is
         if final_status.get("status") != "success":
             return PayinSettlementResult(
                 success=False, tx_hash=final_status.get("tx_hash"), flow=flow,
                 error=final_status.get("error_message") or "settlement failed on-chain",
             )
         return PayinSettlementResult(success=True, tx_hash=final_status.get("tx_hash"), flow=flow)
-    except Ap2Error as exc:
+    except Exception as exc:  # noqa: BLE001 - any error here must become a recorded result, not a crashed tool call
         # Preserve the flow we already knew, same reasoning as
         # pay_button.py's equivalent: a real approve() may already be
         # on-chain for a permit2 flow that then failed to relay.
-        return PayinSettlementResult(success=False, tx_hash=None, flow=flow, error=str(exc))
+        pending, message = classify_settlement_exception(exc, submitted=submitted)
+        return PayinSettlementResult(success=False, tx_hash=None, flow=flow, error=message, pending=pending)
