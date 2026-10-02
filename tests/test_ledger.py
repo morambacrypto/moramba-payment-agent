@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from agent.ledger import STATUS_FAILED, STATUS_REJECTED, STATUS_SETTLED, Ledger
+from agent.ledger import STATUS_FAILED, STATUS_PENDING, STATUS_REJECTED, STATUS_SETTLED, Ledger
 
 
 def make_ledger(tmp_path):
@@ -80,4 +80,17 @@ def test_count_since(tmp_path):
     ledger.record(rail="mpp", recipient="r1", token="USDC", amount=Decimal("1"), status=STATUS_REJECTED)
     ledger.record(rail="mpp", recipient="r1", token="USDC", amount=Decimal("1"), status=STATUS_SETTLED)
 
+    assert ledger.count_since("1970-01-01T00:00:00+00:00") == 2
+
+
+def test_pending_payments_count_as_spent_and_toward_the_count(tmp_path):
+    """A pending payment's outcome is unknown — it may well have settled —
+    so leaving it out of the spend total would let a retry go past the
+    limit."""
+    ledger = make_ledger(tmp_path)
+    ledger.record(rail="ap2", recipient="r1", token="USDC", amount=Decimal("10"), status=STATUS_SETTLED)
+    ledger.record(rail="ap2", recipient="r1", token="USDC", amount=Decimal("7"), status=STATUS_PENDING)
+    ledger.record(rail="ap2", recipient="r1", token="USDC", amount=Decimal("999"), status=STATUS_FAILED)
+
+    assert ledger.spent_since("1970-01-01T00:00:00+00:00") == Decimal("17")
     assert ledger.count_since("1970-01-01T00:00:00+00:00") == 2

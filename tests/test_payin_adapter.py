@@ -162,3 +162,48 @@ def test_pay_payin_stops_before_building_or_relaying_when_balance_is_too_low():
     assert "insufficient token balance" in result.error
     builder.assert_not_called()
     assert not relay.called
+
+
+def _planned(wallet):
+    _mock_init(wallet.address)
+    with patch("agent.adapters.payin.Web3") as MockWeb3:
+        MockWeb3.to_checksum_address.side_effect = lambda a: a
+        MockWeb3.return_value.eth.contract.return_value.functions.decimals.return_value.call.return_value = 6
+        return payin.resolve_payin(BASE_URL, PAYIN_ID, wallet)
+
+
+@respx.mock
+def test_pay_payin_turns_an_unexpected_error_into_a_failed_result():
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    plan = _planned(wallet)
+
+    def broken_builder(w3, account, init):
+        raise RuntimeError("rpc blew up")
+
+    with patch.object(payin, "detect_flow", return_value="plain"), \
+         patch.dict(payin._BUILDER_BY_FLOW, {"plain": broken_builder}):
+        result = payin.pay_payin(BASE_URL, PAYIN_ID, plan, wallet)
+
+    assert not result.success
+    assert not result.pending
+    assert "RuntimeError: rpc blew up" in result.error
+    assert result.flow == "plain"
+
+
+@respx.mock
+def test_pay_payin_reports_pending_when_the_settlement_poll_times_out():
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    plan = _planned(wallet)
+    respx.post(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/pay/{PAYIN_ID}/tnxid/tx-1/relay").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"accepted": True}})
+    )
+
+    stub_body = {"from": wallet.address}
+    with patch.object(payin, "detect_flow", return_value="plain"), \
+         patch.dict(payin._BUILDER_BY_FLOW, {"plain": lambda w3, account, init: stub_body}), \
+         patch.object(payin, "poll_payment_status", side_effect=Ap2Error("timed out waiting for on-chain settlement")):
+        result = payin.pay_payin(BASE_URL, PAYIN_ID, plan, wallet)
+
+    assert not result.success
+    assert result.pending
+    assert "outcome unknown" in result.error

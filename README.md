@@ -5,7 +5,7 @@ x402, AP2 (Autonomous), Moramba Pay Button, Agent Transfer (pay any
 Moramba agent directly by id), and Payin (pay an existing payin_id
 directly) — plus the local ledger, the live limit check, a FastAPI
 service wrapper, the setup wizard, and the MCP tool server, all with a
-passing test suite (193 tests) — including a required `PAYMENT_AGENT_API_KEY`
+passing test suite (228 tests) — including a required `PAYMENT_AGENT_API_KEY`
 bearer-token check in front of the HTTP/MCP server itself (2026-10-02),
 closing a real gap where `TUNNEL=1`'s public URL had no auth of its own.
 Packaged as a proper
@@ -39,7 +39,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 193 tests, all passing
+python -m pytest -q          # 228 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -633,7 +633,7 @@ later phase, once the testnet flow is proven end-to-end.
 
 ## 5. Payment history — local ledger, synced live to Moramba
 
-Every attempt — settled, rejected, or failed — is written to a local
+Every attempt — settled, rejected, failed, or pending — is written to a local
 SQLite ledger **first** (timestamp, rail, recipient, amount + token, tx
 hash/signature, outcome), then synced to **Moramba's own Postgres** on
 every write. SQLite is the fast, always-available copy the agent reads
@@ -641,6 +641,17 @@ from for its own limit checks; Moramba's Postgres is the durable,
 central copy a partner's dashboard — and the boss — reads from. "How
 many payments has this agent made, and to whom" is answered from there,
 not by opening a file on someone's laptop.
+
+**`pending` means the outcome is unknown, not that it failed.** On the
+relay-settled rails (AP2, pay button, payin), once a payment has been
+handed to the relay, a timeout or any error while waiting for its
+settlement is recorded as `pending` — the payment may well have gone
+through, so check the block explorer or Moramba before retrying. Pending
+payments still count toward the spend and count limits (otherwise a retry
+could overspend), and they are not updated afterwards: a `pending` row
+stays `pending`. Anything that goes wrong *before* the submission is a
+plain `failed`, and any unexpected error (not just a known one) now
+becomes a recorded result instead of crashing the tool call.
 
 > **Backend: done (2026-09-29).** `POST /api/v2/morambacrypto/public/agent/:agent_id/payments/sync`
 > is live in moramba-crypto-api (migration 302,

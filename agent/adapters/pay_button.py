@@ -39,6 +39,7 @@ from agent.adapters.ap2 import (
     _BUILDER_BY_FLOW,
     _public_api_request,
     check_wallet_token_balance,
+    classify_settlement_exception,
     detect_flow,
     fetch_payrequest_init,
     poll_payment_status,
@@ -201,6 +202,7 @@ class ButtonSettlementResult:
     flow: str | None
     payin_id: str | None
     error: str | None = None
+    pending: bool = False  # submitted, but its outcome couldn't be confirmed
 
 
 def pay_button(base_url: str, button_id: str, plan: ButtonPaymentPlan, wallet: Wallet) -> ButtonSettlementResult:
@@ -209,6 +211,7 @@ def pay_button(base_url: str, button_id: str, plan: ButtonPaymentPlan, wallet: W
     AP2 rail already implements."""
     payin_id: str | None = None
     flow: str | None = None
+    submitted = False
     try:
         payin = create_payin_by_button_id(
             base_url,
@@ -229,17 +232,22 @@ def pay_button(base_url: str, button_id: str, plan: ButtonPaymentPlan, wallet: W
         pay_body = _BUILDER_BY_FLOW[flow](w3, wallet._account, init)
 
         submit_relay_payment(base_url, payin_id, init.transaction_id, flow, pay_body)
+        submitted = True
         final_status = poll_payment_status(base_url, init.transaction_id)
+        submitted = False  # an outcome is known from here on, whatever it is
         if final_status.get("status") != "success":
             return ButtonSettlementResult(
                 success=False, tx_hash=final_status.get("tx_hash"), flow=flow, payin_id=payin_id,
                 error=final_status.get("error_message") or "settlement failed on-chain",
             )
         return ButtonSettlementResult(success=True, tx_hash=final_status.get("tx_hash"), flow=flow, payin_id=payin_id)
-    except Ap2Error as exc:
+    except Exception as exc:  # noqa: BLE001 - any error here must become a recorded result, not a crashed tool call
         # Preserve whatever we already knew (a payin may well have been
         # created, and a flow chosen, before this failed) — discarding
         # them here would hide exactly the detail needed to debug a
         # partial failure, e.g. a real approve() already sent on-chain
         # for a payin that never got to settle.
-        return ButtonSettlementResult(success=False, tx_hash=None, flow=flow, payin_id=payin_id, error=str(exc))
+        pending, message = classify_settlement_exception(exc, submitted=submitted)
+        return ButtonSettlementResult(
+            success=False, tx_hash=None, flow=flow, payin_id=payin_id, error=message, pending=pending
+        )

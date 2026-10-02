@@ -392,3 +392,125 @@ def test_settle_autonomous_checkout_stops_before_building_or_signing_when_balanc
     assert result.payin_id == "payin-1"
     assert result.chain_id == 42431
     builder.assert_not_called()
+
+
+def test_classify_settlement_exception_before_submission_is_a_plain_failure():
+    pending, message = ap2.classify_settlement_exception(ap2.Ap2Error("relay said no"), submitted=False)
+    assert pending is False
+    assert message == "relay said no"
+
+
+def test_classify_settlement_exception_names_the_type_of_an_unexpected_error():
+    pending, message = ap2.classify_settlement_exception(RuntimeError("rpc blew up"), submitted=False)
+    assert pending is False
+    assert message == "RuntimeError: rpc blew up"
+
+
+def test_classify_settlement_exception_after_submission_is_pending_not_failed():
+    pending, message = ap2.classify_settlement_exception(
+        ap2.Ap2Error("timed out waiting for on-chain settlement"), submitted=True
+    )
+    assert pending is True
+    assert "outcome unknown" in message
+    assert "timed out waiting for on-chain settlement" in message
+    assert "before retrying" in message
+
+
+def _settle_mocks(wallet):
+    respx.post(f"{BASE_URL}/acp/checkout_sessions/sess-1/authorize_autonomous").mock(
+        return_value=httpx.Response(200, json={"id": "sess-1"})
+    )
+    respx.post(f"{BASE_URL}/acp/checkout_sessions/sess-1/start").mock(
+        return_value=httpx.Response(200, json={"continue_url": "https://pay.example/x?payin_id=payin-1"})
+    )
+    respx.get(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/init/payin-1/address/{wallet.address}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "message": "ok",
+                "data": {
+                    "token_address": "0x" + "22" * 20, "token_name": "USDC", "amount": "100000",
+                    "chain_id": 84532, "rpc": "https://rpc.example", "verify_sc_address": "0x" + "33" * 20,
+                    "to": "0x" + "44" * 20, "transaction_id": "tx-1", "nonce": "0",
+                },
+            },
+        )
+    )
+
+
+@respx.mock
+def test_settle_autonomous_checkout_turns_an_unexpected_error_into_a_failed_result():
+    """Found live: a raw web3 error (not an Ap2Error) escaped and crashed
+    the whole tool call with nothing recorded."""
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    session = ap2.CheckoutSession(session_id="sess-1", amount="1000", currency="USD", decimals=2, raw={})
+    _settle_mocks(wallet)
+
+    def broken_builder(w3, account, init):
+        raise RuntimeError("rpc blew up")
+
+    with patch.object(ap2, "detect_flow", return_value="plain"), \
+         patch.dict(ap2._BUILDER_BY_FLOW, {"plain": broken_builder}):
+        result = ap2.settle_autonomous_checkout(
+            base_url=BASE_URL, api_key=API_KEY, agent_id="agent-9", wallet=wallet,
+            session=session, buyer_email="buyer@example.com",
+        )
+
+    assert not result.success
+    assert not result.pending  # nothing was submitted yet — this really failed
+    assert "RuntimeError: rpc blew up" in result.error
+    assert result.payin_id == "payin-1"
+    assert result.flow == "plain"
+    assert result.chain_id == 84532
+
+
+@respx.mock
+def test_settle_autonomous_checkout_reports_pending_when_the_settlement_poll_times_out():
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    session = ap2.CheckoutSession(session_id="sess-1", amount="1000", currency="USD", decimals=2, raw={})
+    _settle_mocks(wallet)
+    respx.post(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/pay/payin-1/tnxid/tx-1/relay").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"accepted": True}})
+    )
+
+    stub_body = {"from": wallet.address}
+    with patch.object(ap2, "detect_flow", return_value="plain"), \
+         patch.dict(ap2._BUILDER_BY_FLOW, {"plain": lambda w3, account, init: stub_body}), \
+         patch.object(ap2, "poll_payment_status", side_effect=ap2.Ap2Error("timed out waiting for on-chain settlement")):
+        result = ap2.settle_autonomous_checkout(
+            base_url=BASE_URL, api_key=API_KEY, agent_id="agent-9", wallet=wallet,
+            session=session, buyer_email="buyer@example.com",
+        )
+
+    assert not result.success
+    assert result.pending
+    assert "outcome unknown" in result.error
+    assert result.payin_id == "payin-1"
+
+
+@respx.mock
+def test_settle_autonomous_checkout_a_settled_payment_is_never_pending_even_if_completion_fails():
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    session = ap2.CheckoutSession(session_id="sess-1", amount="1000", currency="USD", decimals=2, raw={})
+    _settle_mocks(wallet)
+    respx.post(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/pay/payin-1/tnxid/tx-1/relay").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"accepted": True}})
+    )
+    respx.get(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/status/tnxid/tx-1").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"status": "success", "tx_hash": "0xdone"}})
+    )
+    respx.post(f"{BASE_URL}/acp/checkout_sessions/sess-1/complete").mock(
+        return_value=httpx.Response(500, json={"message": "server error"})
+    )
+
+    stub_body = {"from": wallet.address}
+    with patch.object(ap2, "detect_flow", return_value="plain"), \
+         patch.dict(ap2._BUILDER_BY_FLOW, {"plain": lambda w3, account, init: stub_body}):
+        result = ap2.settle_autonomous_checkout(
+            base_url=BASE_URL, api_key=API_KEY, agent_id="agent-9", wallet=wallet,
+            session=session, buyer_email="buyer@example.com",
+        )
+
+    assert not result.success
+    assert not result.pending  # the on-chain outcome was confirmed — it's the completion call that failed
+    assert "server error" in result.error

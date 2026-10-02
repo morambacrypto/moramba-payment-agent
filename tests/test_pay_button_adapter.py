@@ -422,3 +422,46 @@ def test_pay_button_preserves_payin_id_and_flow_when_relay_submission_fails():
     assert result.payin_id == "payin-partial-1"
     assert result.flow == "permit2"
     assert "not configured correctly" in result.error
+
+
+@respx.mock
+def test_pay_button_reports_pending_when_the_settlement_poll_times_out():
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    respx.post(f"{BASE_URL}/api/v2/morambacrypto/public/payin/create/by/button_id/{BUTTON_ID}").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"id": "payin-slow-1"}})
+    )
+    respx.get(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/init/payin-slow-1/address/{wallet.address}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "message": "ok",
+                "data": {
+                    "token_address": "0x20c0000000000000000000000000000000000000", "token_name": "pathusd",
+                    "amount": "1000000", "chain_id": 42431, "rpc": "https://rpc.moderato.tempo.xyz",
+                    "verify_sc_address": "0x" + "33" * 20, "to": "0x6784f65225f7d567cf1535525b0dd720b1450d1b",
+                    "transaction_id": "tx-slow-1", "nonce": "0",
+                },
+            },
+        )
+    )
+    respx.post(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/pay/payin-slow-1/tnxid/tx-slow-1/relay").mock(
+        return_value=httpx.Response(200, json={"success": True, "message": "ok", "data": {"accepted": True}})
+    )
+    plan = pay_button.ButtonPaymentPlan(
+        method=pay_button.ButtonPayoutMethod(
+            payout_destination_id="po-1", network="tempo_testnet", token_name="pathusd",
+            token_address="0x20c0000000000000000000000000000000000000",
+            to_wallet_address="0x6784f65225f7d567cf1535525b0dd720b1450d1b", decimals=6, amount_with_decimal="1000000",
+        ),
+        amount=Decimal("1"), fixed_amount=True,
+    )
+
+    with patch.object(pay_button, "detect_flow", return_value="plain"), \
+         patch.dict(pay_button._BUILDER_BY_FLOW, {"plain": lambda w3, account, init: {"from": wallet.address}}), \
+         patch.object(pay_button, "poll_payment_status", side_effect=pay_button.Ap2Error("timed out waiting for on-chain settlement")):
+        result = pay_button.pay_button(BASE_URL, BUTTON_ID, plan, wallet)
+
+    assert not result.success
+    assert result.pending
+    assert result.payin_id == "payin-slow-1"
+    assert "outcome unknown" in result.error

@@ -573,6 +573,24 @@ def poll_payment_status(
     raise Ap2Error("timed out waiting for on-chain settlement")
 
 
+def classify_settlement_exception(exc: Exception, *, submitted: bool) -> tuple[bool, str]:
+    """Turns an exception raised mid-settlement into `(pending, message)`.
+    `submitted` is True once the payment was handed to the relay and
+    nothing has confirmed an outcome yet — from that point a timeout or
+    any error while waiting does not mean the payment failed, so it is
+    reported as pending (outcome unknown) rather than failed. Before that
+    point it really did fail. Found live: an RPC error that wasn't an
+    `Ap2Error` escaped the old `except Ap2Error` and crashed the whole
+    tool call with nothing recorded."""
+    detail = str(exc) if isinstance(exc, Ap2Error) else f"{type(exc).__name__}: {exc}"
+    if submitted:
+        return True, (
+            f"outcome unknown — the payment was submitted but its settlement could not be confirmed "
+            f"({detail}); check the block explorer or Moramba before retrying"
+        )
+    return False, detail
+
+
 @dataclass(frozen=True)
 class Ap2SettlementResult:
     success: bool
@@ -583,6 +601,9 @@ class Ap2SettlementResult:
     # From the payin's own init response — only known once that call
     # succeeded, so None for a failure before that point.
     chain_id: int | None = None
+    # True when the payment was submitted but its outcome couldn't be
+    # confirmed — not the same as `success=False` meaning it failed.
+    pending: bool = False
 
 
 def settle_autonomous_checkout(
@@ -603,6 +624,7 @@ def settle_autonomous_checkout(
     payin_id: str | None = None
     flow: str | None = None
     chain_id: int | None = None
+    submitted = False
     try:
         authorize_autonomous(base_url, api_key, session, agent_id, wallet)
         payin_id = start_checkout_payment(base_url, api_key, session.session_id)
@@ -615,9 +637,11 @@ def settle_autonomous_checkout(
         pay_body = _BUILDER_BY_FLOW[flow](w3, wallet._account, init)
 
         submit_relay_payment(base_url, payin_id, init.transaction_id, flow, pay_body)
+        submitted = True
         final_status = poll_payment_status(
             base_url, init.transaction_id, poll_interval_seconds=poll_interval_seconds, timeout_seconds=poll_timeout_seconds
         )
+        submitted = False  # an outcome is known from here on, whatever it is
         if final_status.get("status") != "success":
             return Ap2SettlementResult(
                 success=False, tx_hash=final_status.get("tx_hash"), flow=flow, payin_id=payin_id,
@@ -637,13 +661,14 @@ def settle_autonomous_checkout(
         return Ap2SettlementResult(
             success=True, tx_hash=final_status.get("tx_hash"), flow=flow, payin_id=payin_id, chain_id=chain_id
         )
-    except Ap2Error as exc:
+    except Exception as exc:  # noqa: BLE001 - any error here must become a recorded result, not a crashed tool call
         # Preserve whatever we already knew — a payin may well have been
         # created, and a flow chosen, before this failed; discarding them
         # here would hide exactly the detail needed to debug a partial
         # failure (e.g. a real approve() already sent on-chain for a
         # payin that never got to settle — see pay_button.py's identical
         # fix for the same pattern).
+        pending, message = classify_settlement_exception(exc, submitted=submitted)
         return Ap2SettlementResult(
-            success=False, tx_hash=None, flow=flow, payin_id=payin_id, error=str(exc), chain_id=chain_id
+            success=False, tx_hash=None, flow=flow, payin_id=payin_id, error=message, chain_id=chain_id, pending=pending
         )
