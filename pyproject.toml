@@ -41,3 +41,8 @@ moramba-payment-agent-rotate-key = "agent.setup:rotate_key"
 
 [tool.setuptools]
 packages = ["agent", "agent.adapters"]
+
+[tool.pytest.ini_options]
+markers = [
+    "real_balance_check: run the real token balance check instead of the default no-op (see tests/conftest.py)",
+]

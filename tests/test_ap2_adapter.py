@@ -3,6 +3,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 import respx
 from eth_account import Account
 from eth_account.messages import encode_defunct, encode_typed_data
@@ -268,3 +269,126 @@ def test_settle_autonomous_checkout_preserves_payin_id_and_flow_when_relay_submi
     assert result.payin_id == "payin-partial-2"
     assert result.flow == "permit2"
     assert "not configured correctly" in result.error
+
+
+def test_approve_if_needed_explains_an_unfunded_wallet_instead_of_crashing():
+    """Found live: a wallet with no balance for network fees made
+    eth_estimateGas fail with 'gas required exceeds allowance (0)', which
+    escaped as a raw web3 error and crashed the whole pay_payin tool call
+    with nothing recorded."""
+    w3 = MagicMock()
+    w3.eth.chain_id = 42431
+    token = MagicMock()
+    token.functions.allowance.return_value.call.return_value = 0
+    token.functions.approve.return_value.build_transaction.side_effect = Exception(
+        "{'code': -32000, 'message': 'gas required exceeds allowance (0)'}"
+    )
+    w3.eth.contract.return_value = token
+    account = MagicMock()
+    account.address = "0x" + "11" * 20
+
+    try:
+        ap2._approve_if_needed(w3, account, "0x" + "22" * 20, "0x" + "33" * 20, 1000)
+        assert False, "expected Ap2Error"
+    except ap2.Ap2Error as exc:
+        assert "fund it first" in str(exc)
+        assert account.address in str(exc)
+        assert "42431" in str(exc)
+
+
+def test_approve_if_needed_skips_the_transaction_when_allowance_is_already_enough():
+    w3 = MagicMock()
+    token = MagicMock()
+    token.functions.allowance.return_value.call.return_value = 5000
+    w3.eth.contract.return_value = token
+
+    ap2._approve_if_needed(w3, MagicMock(), "0x" + "22" * 20, "0x" + "33" * 20, 1000)
+
+    token.functions.approve.assert_not_called()
+
+
+def _balance_w3(balance: int, decimals: int = 6):
+    w3 = MagicMock()
+    token = MagicMock()
+    token.functions.balanceOf.return_value.call.return_value = balance
+    token.functions.decimals.return_value.call.return_value = decimals
+    w3.eth.contract.return_value = token
+    return w3
+
+
+def _balance_init(amount: str = "1500000"):
+    return ap2.PayInit(
+        token_address="0x" + "22" * 20, token_name="pathusd", amount=amount, chain_id=42431,
+        rpc="https://rpc.example", verify_sc_address="0x" + "33" * 20, to="0x" + "44" * 20,
+        transaction_id="tx-1", nonce=None, raw={},
+    )
+
+
+@pytest.mark.real_balance_check
+def test_check_wallet_token_balance_passes_when_the_wallet_holds_enough():
+    ap2.check_wallet_token_balance(_balance_w3(2_000_000), "0x" + "11" * 20, _balance_init("1500000"))
+
+
+@pytest.mark.real_balance_check
+def test_check_wallet_token_balance_names_the_wallet_token_and_shortfall():
+    with pytest.raises(ap2.Ap2Error) as exc:
+        ap2.check_wallet_token_balance(_balance_w3(0), "0x" + "11" * 20, _balance_init("1500000"))
+
+    message = str(exc.value)
+    assert "insufficient token balance" in message
+    assert "0x" + "11" * 20 in message
+    assert "pathusd" in message
+    assert "needs 1.5" in message
+    assert "fund it first" in message
+
+
+@pytest.mark.real_balance_check
+def test_check_wallet_token_balance_fails_clearly_when_the_balance_cannot_be_read():
+    w3 = MagicMock()
+    w3.eth.contract.return_value.functions.balanceOf.return_value.call.side_effect = Exception("rpc down")
+
+    with pytest.raises(ap2.Ap2Error) as exc:
+        ap2.check_wallet_token_balance(w3, "0x" + "11" * 20, _balance_init())
+
+    assert "could not read token balance" in str(exc.value)
+
+
+@pytest.mark.real_balance_check
+@respx.mock
+def test_settle_autonomous_checkout_stops_before_building_or_signing_when_balance_is_too_low():
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    session = ap2.CheckoutSession(session_id="sess-1", amount="1500000", currency="PATHUSD", decimals=6, raw={})
+    respx.post(f"{BASE_URL}/acp/checkout_sessions/sess-1/authorize_autonomous").mock(
+        return_value=httpx.Response(200, json={"id": "sess-1"})
+    )
+    respx.post(f"{BASE_URL}/acp/checkout_sessions/sess-1/start").mock(
+        return_value=httpx.Response(200, json={"continue_url": "https://pay.example/x?payin_id=payin-1"})
+    )
+    respx.get(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/init/payin-1/address/{wallet.address}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "message": "ok",
+                "data": {
+                    "token_address": "0x" + "22" * 20, "token_name": "pathusd", "amount": "1500000",
+                    "chain_id": 42431, "rpc": "https://rpc.example", "verify_sc_address": "0x" + "33" * 20,
+                    "to": "0x" + "44" * 20, "transaction_id": "tx-1", "nonce": "0",
+                },
+            },
+        )
+    )
+    builder = MagicMock()
+
+    with patch.object(ap2, "Web3") as MockWeb3, patch.dict(ap2._BUILDER_BY_FLOW, {"plain": builder, "permit2": builder, "authorization": builder}):
+        MockWeb3.to_checksum_address.side_effect = lambda a: a
+        MockWeb3.return_value = _balance_w3(0)
+        result = ap2.settle_autonomous_checkout(
+            base_url=BASE_URL, api_key=API_KEY, agent_id="agent-9", wallet=wallet,
+            session=session, buyer_email="buyer@example.com",
+        )
+
+    assert not result.success
+    assert "insufficient token balance" in result.error
+    assert result.payin_id == "payin-1"
+    assert result.chain_id == 42431
+    builder.assert_not_called()

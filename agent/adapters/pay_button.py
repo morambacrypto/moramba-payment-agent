@@ -38,6 +38,7 @@ from agent.adapters.ap2 import (
     Ap2Error,
     _BUILDER_BY_FLOW,
     _public_api_request,
+    check_wallet_token_balance,
     detect_flow,
     fetch_payrequest_init,
     poll_payment_status,
@@ -223,6 +224,7 @@ def pay_button(base_url: str, button_id: str, plan: ButtonPaymentPlan, wallet: W
 
         init = fetch_payrequest_init(base_url, wallet.address, payin_id)
         w3 = Web3(Web3.HTTPProvider(init.rpc))
+        check_wallet_token_balance(w3, wallet.address, init)
         flow = detect_flow(w3, init.token_address)
         pay_body = _BUILDER_BY_FLOW[flow](w3, wallet._account, init)
 

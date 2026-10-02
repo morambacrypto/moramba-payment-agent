@@ -2,6 +2,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 import respx
 
 from agent.adapters import payin
@@ -134,3 +135,30 @@ def test_pay_payin_reports_failure_when_settlement_status_is_not_success():
 
     assert not result.success
     assert result.error == "reverted"
+
+
+@pytest.mark.real_balance_check
+@respx.mock
+def test_pay_payin_stops_before_building_or_relaying_when_balance_is_too_low():
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    _mock_init(wallet.address)
+    relay = respx.post(f"{BASE_URL}/api/v2/morambacrypto/public/payrequest/pay/{PAYIN_ID}/tnxid/tx-1/relay")
+
+    with patch("agent.adapters.payin.Web3") as MockWeb3:
+        MockWeb3.to_checksum_address.side_effect = lambda a: a
+        contract = MockWeb3.return_value.eth.contract.return_value
+        contract.functions.decimals.return_value.call.return_value = 6
+        plan = payin.resolve_payin(BASE_URL, PAYIN_ID, wallet)
+
+    builder = MagicMock()
+    with patch("agent.adapters.payin.Web3") as MockWeb3, \
+         patch.dict(payin._BUILDER_BY_FLOW, {"plain": builder, "permit2": builder, "authorization": builder}):
+        token = MockWeb3.return_value.eth.contract.return_value
+        token.functions.balanceOf.return_value.call.return_value = 0
+        token.functions.decimals.return_value.call.return_value = 6
+        result = payin.pay_payin(BASE_URL, PAYIN_ID, plan, wallet)
+
+    assert not result.success
+    assert "insufficient token balance" in result.error
+    builder.assert_not_called()
+    assert not relay.called
