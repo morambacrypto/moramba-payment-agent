@@ -5,9 +5,14 @@ import respx
 from x402.http.utils import encode_payment_required_header, encode_payment_response_header
 from x402.schemas import PaymentRequired, PaymentRequirements, SettleResponse
 
+from unittest.mock import patch
+
+from agent import balance
+from agent import engine as engine_module
+from agent.adapters.base import PaymentResult
 from agent.config import Settings
 from agent.engine import Agent
-from agent.ledger import STATUS_REJECTED, STATUS_SETTLED
+from agent.ledger import STATUS_FAILED, STATUS_REJECTED, STATUS_SETTLED
 from agent.signing import load_wallet
 
 TEST_PRIVATE_KEY = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
@@ -164,3 +169,65 @@ def test_pay_via_x402_rejected_by_local_limit_never_signs_or_retries(tmp_path):
     assert record.status == STATUS_REJECTED
     assert "per_transaction_limit" in record.reason
     assert route.call_count == 1
+
+
+def _probe_returns_402():
+    header_value = encode_payment_required_header(make_payment_required())
+    respx.get(RESOURCE_URL).mock(
+        return_value=httpx.Response(402, headers={"PAYMENT-REQUIRED": header_value}, json={"ok": False})
+    )
+
+
+@respx.mock
+def test_pay_via_x402_fails_before_signing_when_the_wallet_lacks_the_token(tmp_path):
+    # The challenge's chain (Base Sepolia, 84532) has to be one we have an
+    # RPC for — this wallet's own configured chain here.
+    settings = make_settings(tmp_path, chain_id=84532, rpc_url="https://base-sepolia.example")
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "USD Coin"}])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    _probe_returns_402()
+    reason = "insufficient token balance: wallet 0xabc has 0 USD Coin, needs 0.01 — fund it first"
+
+    agent = Agent(settings)
+    try:
+        with patch.object(balance, "insufficient_balance_reason", return_value=reason) as mock_check, \
+             patch.object(engine_module.x402, "settle") as mock_settle:
+            record = agent.pay_via_x402(url=RESOURCE_URL)
+    finally:
+        agent.close()
+
+    assert record is not None
+    assert record.status == STATUS_FAILED
+    assert record.reason == reason
+    assert record.chain_id == 84532
+    mock_settle.assert_not_called()  # nothing was signed
+    assert mock_check.call_args.kwargs["token_address"] == ASSET
+    assert mock_check.call_args.kwargs["rpc_url"] == "https://base-sepolia.example"
+    assert mock_check.call_args.kwargs["needed_units"] == 10000
+
+
+@respx.mock
+def test_pay_via_x402_skips_the_balance_check_on_a_chain_with_no_known_rpc(tmp_path):
+    # Default test settings are chain 42431; the challenge is for 84532,
+    # which has neither a matching wallet chain nor a known public RPC.
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "USD Coin"}])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    _probe_returns_402()
+
+    agent = Agent(settings)
+    try:
+        with patch.object(balance, "insufficient_balance_reason") as mock_check, \
+             patch.object(engine_module.x402, "settle", return_value=PaymentResult(success=True, tx_hash="0xok")):
+            record = agent.pay_via_x402(url=RESOURCE_URL)
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_SETTLED
+    mock_check.assert_not_called()
