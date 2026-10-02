@@ -18,6 +18,7 @@ from agent.adapters.ap2 import (
     _BUILDER_BY_FLOW,
     Ap2Error,
     PayInit,
+    check_wallet_token_balance,
     detect_flow,
     fetch_payrequest_init,
     poll_payment_status,
@@ -80,6 +81,7 @@ def pay_payin(base_url: str, payin_id: str, plan: PayinPlan, wallet: Wallet) -> 
     try:
         init = plan.init
         w3 = Web3(Web3.HTTPProvider(init.rpc))
+        check_wallet_token_balance(w3, wallet.address, init)
         flow = detect_flow(w3, init.token_address)
         pay_body = _BUILDER_BY_FLOW[flow](w3, wallet._account, init)
 

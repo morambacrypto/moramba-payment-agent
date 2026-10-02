@@ -29,6 +29,7 @@ import hashlib
 import secrets
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -47,6 +48,8 @@ EIP1967_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a
 
 _ERC20_MINI_ABI = [
     {"name": "name", "inputs": [], "outputs": [{"type": "string"}], "stateMutability": "view", "type": "function"},
+    {"name": "decimals", "inputs": [], "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"},
+    {"name": "balanceOf", "inputs": [{"type": "address"}], "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"name": "nonces", "inputs": [{"type": "address"}], "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"name": "allowance", "inputs": [{"type": "address"}, {"type": "address"}], "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"name": "approve", "inputs": [{"type": "address"}, {"type": "uint256"}], "outputs": [{"type": "bool"}], "stateMutability": "nonpayable", "type": "function"},
@@ -351,17 +354,58 @@ def _resolve_token_domain(w3: Web3, token_address: str) -> dict[str, str]:
         return {"name": token.functions.name().call(), "version": "1"}
 
 
+def check_wallet_token_balance(w3: Web3, wallet_address: str, init: "PayInit") -> None:
+    """Raises `Ap2Error` if the wallet holds less of the payin's token than
+    the payin needs. Run before anything is built, signed or approved —
+    found live: an empty wallet only failed deep inside the Permit2
+    approve() step, with a raw RPC error. Shared by every flow that settles
+    a payin through the relay (AP2, pay button, payin)."""
+    token = w3.eth.contract(address=Web3.to_checksum_address(init.token_address), abi=_ERC20_MINI_ABI)
+    try:
+        balance = token.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
+    except Exception as exc:  # noqa: BLE001 - surfaced as a failed payment, same as every other read here
+        raise Ap2Error(f"could not read token balance for {wallet_address}: {exc}") from exc
+    needed = int(init.amount)
+    if balance >= needed:
+        return
+    try:
+        decimals = token.functions.decimals().call()
+    except Exception:  # noqa: BLE001 - only used to make the message readable
+        decimals = None
+
+    def show(units: int) -> str:
+        return str(Decimal(units) / (Decimal(10) ** decimals)) if decimals is not None else f"{units} (minor units)"
+
+    raise Ap2Error(
+        f"insufficient token balance: wallet {wallet_address} has {show(balance)} {init.token_name}, "
+        f"needs {show(needed)} — fund it first"
+    )
+
+
 def _approve_if_needed(w3: Web3, account: LocalAccount, token_address: str, spender: str, amount: int) -> None:
     token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=_ERC20_MINI_ABI)
     current = token.functions.allowance(account.address, Web3.to_checksum_address(spender)).call()
     if current >= amount:
         return
-    tx = token.functions.approve(Web3.to_checksum_address(spender), amount).build_transaction(
-        {"chainId": w3.eth.chain_id, "from": account.address, "nonce": w3.eth.get_transaction_count(account.address), "gasPrice": w3.eth.gas_price}
-    )
-    signed = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    chain_id = w3.eth.chain_id
+    try:
+        tx = token.functions.approve(Web3.to_checksum_address(spender), amount).build_transaction(
+            {"chainId": chain_id, "from": account.address, "nonce": w3.eth.get_transaction_count(account.address), "gasPrice": w3.eth.gas_price}
+        )
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    except Exception as exc:  # noqa: BLE001 - an RPC/web3 error here must become a failed payment, not a crashed tool call
+        # Found live: a wallet with no balance for network fees made
+        # eth_estimateGas fail with "gas required exceeds allowance (0)",
+        # which escaped as a raw web3 error and crashed the whole tool
+        # call with nothing recorded. This first-time Permit2 approve()
+        # is the one step that needs the wallet itself to hold fee funds.
+        hint = ""
+        text = str(exc).lower()
+        if "exceeds allowance" in text or "insufficient funds" in text:
+            hint = f" — wallet {account.address} has no balance to pay network fees on chain {chain_id}; fund it first"
+        raise Ap2Error(f"approve() for Permit2 could not be sent: {exc}{hint}") from exc
     if receipt.status == 0:
         raise Ap2Error(f"approve() tx {_hex0x(tx_hash)} reverted on-chain")
 
@@ -566,6 +610,7 @@ def settle_autonomous_checkout(
         chain_id = init.chain_id
 
         w3 = Web3(Web3.HTTPProvider(init.rpc))
+        check_wallet_token_balance(w3, wallet.address, init)
         flow = detect_flow(w3, init.token_address)
         pay_body = _BUILDER_BY_FLOW[flow](w3, wallet._account, init)
 
