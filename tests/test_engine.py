@@ -4,11 +4,12 @@ from unittest.mock import patch
 import httpx
 import respx
 
+from agent import balance
 from agent import engine as engine_module
 from agent.adapters.base import PaymentResult
 from agent.config import Settings
 from agent.engine import Agent
-from agent.ledger import STATUS_REJECTED, STATUS_SETTLED
+from agent.ledger import STATUS_FAILED, STATUS_REJECTED, STATUS_SETTLED
 from agent.signing import load_wallet
 
 TEST_PRIVATE_KEY = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
@@ -235,3 +236,67 @@ def test_pay_via_mpp_rejected_when_wallet_not_registered_to_agent(tmp_path):
 
     assert record.status == STATUS_REJECTED
     assert "registered payout wallets" in record.reason
+
+
+MPP_TOKEN = {
+    "id": "t-1", "network": "Tempo", "chain": 42431, "network_type": "testnet",
+    "rpc_url": "https://rpc.moderato.tempo.xyz", "token_name": "USDC",
+    "token_address": "0x" + "20" * 20,
+}
+
+
+@respx.mock
+def test_pay_via_mpp_fails_before_signing_when_the_wallet_lacks_the_token(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[MPP_TOKEN])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    reason = "insufficient token balance: wallet 0xabc has 0 USDC, needs 2.5 — fund it first"
+
+    agent = Agent(settings)
+    try:
+        with patch.object(balance, "insufficient_balance_reason", return_value=reason) as mock_check, \
+             patch.object(engine_module.mpp, "pay") as mock_pay:
+            record = agent.pay_via_mpp(
+                receiver_base_url="https://receiver.example", receiver_agent_id="receiver-agent-1",
+                amount=Decimal("2.5"), token="USDC", payout_agent_id="payer-agent-9",
+            )
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_FAILED
+    assert record.reason == reason
+    assert record.chain_id == 42431
+    mock_pay.assert_not_called()  # nothing was signed or sent
+    assert mock_check.call_args.kwargs["token_address"] == MPP_TOKEN["token_address"]
+    assert mock_check.call_args.kwargs["rpc_url"] == MPP_TOKEN["rpc_url"]
+    assert mock_check.call_args.kwargs["needed_amount"] == Decimal("2.5")
+    assert mock_check.call_args.kwargs["wallet_address"] == wallet.address
+
+
+@respx.mock
+def test_pay_via_mpp_skips_the_balance_check_when_the_token_has_no_contract_address(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "USDC"}])  # no token_address to read
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.post("https://receiver.example/agent-api/payout/agent/receiver-agent-1/pay").mock(
+        return_value=httpx.Response(200, json={"success": True, "tx_hash": "0xabc123"})
+    )
+
+    agent = Agent(settings)
+    try:
+        with patch.object(balance, "insufficient_balance_reason") as mock_check:
+            record = agent.pay_via_mpp(
+                receiver_base_url="https://receiver.example", receiver_agent_id="receiver-agent-1",
+                amount=Decimal("2.5"), token="USDC", payout_agent_id="payer-agent-9",
+            )
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_SETTLED
+    mock_check.assert_not_called()
