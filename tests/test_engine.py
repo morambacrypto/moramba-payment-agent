@@ -9,7 +9,7 @@ from agent import engine as engine_module
 from agent.adapters.base import PaymentResult
 from agent.config import Settings
 from agent.engine import Agent
-from agent.ledger import STATUS_FAILED, STATUS_REJECTED, STATUS_SETTLED
+from agent.ledger import STATUS_FAILED, STATUS_PENDING, STATUS_REJECTED, STATUS_SETTLED
 from agent.signing import load_wallet
 
 TEST_PRIVATE_KEY = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
@@ -163,34 +163,6 @@ def test_pay_agent_requires_explicit_token_when_multiple_are_accepted(tmp_path):
 
 
 @respx.mock
-def test_pay_via_mpp_settles_and_records_ledger_entry(tmp_path):
-    settings = make_settings(tmp_path)
-    wallet = load_wallet(TEST_PRIVATE_KEY)
-    mock_agent_lookup(wallet.address)
-    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
-        return_value=httpx.Response(404)
-    )
-    respx.post("https://receiver.example/agent-api/payout/agent/receiver-agent-1/pay").mock(
-        return_value=httpx.Response(200, json={"success": True, "tx_hash": "0xabc123"})
-    )
-
-    agent = Agent(settings)
-    try:
-        record = agent.pay_via_mpp(
-            receiver_base_url="https://receiver.example",
-            receiver_agent_id="receiver-agent-1",
-            amount=Decimal("2.5"),
-            token="USDC",
-            payout_agent_id="payer-agent-9",
-        )
-    finally:
-        agent.close()
-
-    assert record.status == STATUS_SETTLED
-    assert record.tx_hash == "0xabc123"
-
-
-@respx.mock
 def test_pay_via_mpp_rejected_by_local_limit_never_hits_the_network(tmp_path):
     settings = make_settings(tmp_path)
     wallet = load_wallet(TEST_PRIVATE_KEY)
@@ -245,11 +217,189 @@ MPP_TOKEN = {
 }
 
 
+RECEIVER_WALLET = "0x6784f65225f7d567cf1535525b0dd720b1450d1b"
+
+
+def mock_receiving_agent(receiver_id="receiver-agent-1", wallet=RECEIVER_WALLET, status="active", http_status=200):
+    """The receiving agent's own Moramba record — where the MPP rail reads
+    who a payment goes to, the same source the receiving server reads."""
+    if http_status != 200:
+        return respx.get(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent", params={"agent_id": receiver_id}).mock(
+            return_value=httpx.Response(http_status, json={"message": "nope"})
+        )
+    return respx.get(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent", params={"agent_id": receiver_id}).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "message": "ok",
+                "data": {
+                    "id": receiver_id, "status": status, "is_receiving_agent": True,
+                    "receiving_config": {"receive_wallet_address": wallet, "accepted_tokens": []},
+                },
+            },
+        )
+    )
+
+
+def pay_mpp(agent, **overrides):
+    kwargs = dict(
+        receiver_base_url="https://receiver.example", receiver_agent_id="receiver-agent-1",
+        amount=Decimal("2.5"), token="USDC", payout_agent_id="payer-agent-9",
+    )
+    kwargs.update(overrides)
+    return agent.pay_via_mpp(**kwargs)
+
+
+@respx.mock
+def test_pay_via_mpp_settles_and_records_ledger_entry(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[MPP_TOKEN])
+    mock_receiving_agent()
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.post("https://receiver.example/agent-api/payout/agent/receiver-agent-1/pay").mock(
+        return_value=httpx.Response(200, json={"success": True, "tx_hash": "0xabc123"})
+    )
+
+    agent = Agent(settings)
+    try:
+        record = pay_mpp(agent)
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_SETTLED
+    assert record.tx_hash == "0xabc123"
+    assert record.chain_id == 42431
+
+
+@respx.mock
+def test_pay_via_mpp_pins_what_the_challenge_may_ask_for(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[MPP_TOKEN])
+    mock_receiving_agent()
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+
+    agent = Agent(settings)
+    try:
+        with patch.object(engine_module.mpp, "pay", return_value=PaymentResult(success=True, tx_hash="0xok")) as mock_pay:
+            pay_mpp(agent)
+    finally:
+        agent.close()
+
+    expected = mock_pay.call_args.kwargs["expected"]
+    assert expected.chain_id == 42431
+    assert expected.token_address == MPP_TOKEN["token_address"]
+    assert expected.recipient == RECEIVER_WALLET  # from the receiving agent's own record
+    assert expected.max_units == 2_500_000  # 2.5 at the token's 6 on-chain decimals
+    assert mock_pay.call_args.kwargs["rpc_url"] == MPP_TOKEN["rpc_url"]
+
+
+@respx.mock
+def test_pay_via_mpp_to_an_address_pins_that_address_and_never_looks_up_an_agent(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[MPP_TOKEN])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    destination = "0x" + "55" * 20
+
+    agent = Agent(settings)
+    try:
+        with patch.object(engine_module.mpp, "pay", return_value=PaymentResult(success=True, tx_hash="0xok")) as mock_pay:
+            pay_mpp(agent, payment_to="address", to_address=destination)
+    finally:
+        agent.close()
+
+    assert mock_pay.call_args.kwargs["expected"].recipient == destination
+
+
+@respx.mock
+def test_pay_via_mpp_rejects_a_token_on_a_chain_that_is_not_tempo(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{**MPP_TOKEN, "chain": 8453, "network_type": "mainnet"}])
+
+    agent = Agent(settings)
+    try:
+        with patch.object(engine_module.mpp, "pay") as mock_pay:
+            record = pay_mpp(agent)
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_REJECTED
+    assert "MPP only runs on Tempo" in record.reason
+    assert "8453" in record.reason
+    mock_pay.assert_not_called()
+
+
+@respx.mock
+def test_pay_via_mpp_rejects_a_token_with_no_contract_address_on_record(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "USDC"}])
+
+    agent = Agent(settings)
+    try:
+        with patch.object(engine_module.mpp, "pay") as mock_pay:
+            record = pay_mpp(agent)
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_REJECTED
+    assert "contract address" in record.reason
+    mock_pay.assert_not_called()
+
+
+@respx.mock
+def test_pay_via_mpp_rejects_when_the_receiving_agent_cannot_be_looked_up(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[MPP_TOKEN])
+    mock_receiving_agent(http_status=404)
+
+    agent = Agent(settings)
+    try:
+        with patch.object(engine_module.mpp, "pay") as mock_pay:
+            record = pay_mpp(agent)
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_REJECTED
+    assert "could not look up receiving agent" in record.reason
+    mock_pay.assert_not_called()  # can't check who it pays, so nothing is paid
+
+
+@respx.mock
+def test_pay_via_mpp_rejects_an_inactive_receiving_agent(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[MPP_TOKEN])
+    mock_receiving_agent(status="inactive")
+
+    agent = Agent(settings)
+    try:
+        with patch.object(engine_module.mpp, "pay") as mock_pay:
+            record = pay_mpp(agent)
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_REJECTED
+    assert "is not active" in record.reason
+    mock_pay.assert_not_called()
+
+
 @respx.mock
 def test_pay_via_mpp_fails_before_signing_when_the_wallet_lacks_the_token(tmp_path):
     settings = make_settings(tmp_path)
     wallet = load_wallet(TEST_PRIVATE_KEY)
     mock_agent_lookup(wallet.address, allowed_tokens=[MPP_TOKEN])
+    mock_receiving_agent()
     respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
         return_value=httpx.Response(404)
     )
@@ -259,10 +409,7 @@ def test_pay_via_mpp_fails_before_signing_when_the_wallet_lacks_the_token(tmp_pa
     try:
         with patch.object(balance, "insufficient_balance_reason", return_value=reason) as mock_check, \
              patch.object(engine_module.mpp, "pay") as mock_pay:
-            record = agent.pay_via_mpp(
-                receiver_base_url="https://receiver.example", receiver_agent_id="receiver-agent-1",
-                amount=Decimal("2.5"), token="USDC", payout_agent_id="payer-agent-9",
-            )
+            record = pay_mpp(agent)
     finally:
         agent.close()
 
@@ -277,26 +424,23 @@ def test_pay_via_mpp_fails_before_signing_when_the_wallet_lacks_the_token(tmp_pa
 
 
 @respx.mock
-def test_pay_via_mpp_skips_the_balance_check_when_the_token_has_no_contract_address(tmp_path):
+def test_pay_via_mpp_records_pending_when_the_outcome_is_unknown(tmp_path):
     settings = make_settings(tmp_path)
     wallet = load_wallet(TEST_PRIVATE_KEY)
-    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "USDC"}])  # no token_address to read
+    mock_agent_lookup(wallet.address, allowed_tokens=[MPP_TOKEN])
+    mock_receiving_agent()
     respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
         return_value=httpx.Response(404)
     )
-    respx.post("https://receiver.example/agent-api/payout/agent/receiver-agent-1/pay").mock(
-        return_value=httpx.Response(200, json={"success": True, "tx_hash": "0xabc123"})
-    )
+    unknown = PaymentResult(success=False, pending=True, error="outcome unknown — the payment was sent but not confirmed")
 
     agent = Agent(settings)
     try:
-        with patch.object(balance, "insufficient_balance_reason") as mock_check:
-            record = agent.pay_via_mpp(
-                receiver_base_url="https://receiver.example", receiver_agent_id="receiver-agent-1",
-                amount=Decimal("2.5"), token="USDC", payout_agent_id="payer-agent-9",
-            )
+        with patch.object(engine_module.mpp, "pay", return_value=unknown):
+            record = pay_mpp(agent)
+        spent = agent.ledger.spent_since("1970-01-01T00:00:00+00:00")
     finally:
         agent.close()
 
-    assert record.status == STATUS_SETTLED
-    mock_check.assert_not_called()
+    assert record.status == STATUS_PENDING
+    assert spent == Decimal("2.5")  # may have gone through, so it still counts against limits

@@ -106,7 +106,24 @@ def test_check_spend_limits_tool(tmp_path):
 @respx.mock
 def test_pay_via_mpp_tool_settles(tmp_path):
     agent = make_agent(tmp_path)
-    mock_agent_lookup(agent.wallet.address, allowed_tokens=[{"token_name": "USDC"}])
+    mock_agent_lookup(agent.wallet.address, allowed_tokens=[{
+        "id": "t-1", "network": "Tempo", "chain": 42431, "network_type": "testnet",
+        "rpc_url": "https://rpc.moderato.tempo.xyz", "token_name": "USDC", "token_address": "0x" + "20" * 20,
+    }])
+    respx.get(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent", params={"agent_id": "receiver-agent-1"}).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "message": "ok",
+                "data": {
+                    "id": "receiver-agent-1", "status": "active", "is_receiving_agent": True,
+                    "receiving_config": {
+                        "receive_wallet_address": "0x6784f65225f7d567cf1535525b0dd720b1450d1b", "accepted_tokens": [],
+                    },
+                },
+            },
+        )
+    )
     respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
         return_value=httpx.Response(404)
     )

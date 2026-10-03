@@ -137,42 +137,90 @@ class Agent:
                 status=STATUS_REJECTED, reason=check.reason,
             )
 
-        # Same reasoning as erc20.pay's own pre-check: confirm the wallet
-        # holds the token before signing anything. The token is looked up
-        # by name among this agent's own payout tokens (the same name the
-        # limit check above already required); one with no contract
-        # address on record has nothing to read, so the receiving
-        # server's own checks are all that apply to it.
+        def refuse(reason: str, chain_id: int | None = None) -> PaymentRecord:
+            return self.ledger.record(
+                rail="mpp", recipient=recipient, token=token, amount=amount,
+                chain_id=chain_id, status=STATUS_REJECTED, reason=reason,
+            )
+
+        # MPP runs on Tempo only, and pays a challenge a *server* wrote, so
+        # everything that challenge may ask for is pinned down here first:
+        # the token (by contract address — the server identifies tokens by
+        # address, and a name is rejected), its chain, the recipient and a
+        # ceiling on the amount. `mpp.pay` refuses any challenge that
+        # strays from this before anything is signed. A token with no
+        # contract address on record can't be pinned, so it isn't payable.
         limits = self._agents_client.get_agent(self._settings.moramba_agent_id)
         resolved = limits.resolve_payout_token(token)
-        if resolved is not None and resolved.token_address:
-            reason = balance.insufficient_balance_reason(
-                rpc_url=resolved.rpc_url or self._settings.rpc_url,
-                token_address=resolved.token_address,
-                wallet_address=self.wallet.address,
-                label=resolved.token_name or token,
-                needed_amount=amount,
+        if resolved is None or not resolved.token_address:
+            return refuse(
+                f"MPP needs this agent's {token!r} payout token to have a contract address on record, "
+                "so the payment challenge can be verified before anything is signed"
             )
-            if reason:
-                return self.ledger.record(
-                    rail="mpp", recipient=recipient, token=token, amount=amount,
-                    chain_id=resolved.chain or self._settings.chain_id,
-                    status=STATUS_FAILED, reason=reason,
-                )
+        if resolved.chain not in mpp.TEMPO_CHAIN_IDS:
+            return refuse(
+                f"MPP only runs on Tempo (chains {sorted(mpp.TEMPO_CHAIN_IDS)}); this agent's {token!r} "
+                f"is configured for chain {resolved.chain}",
+                resolved.chain,
+            )
+        chain_id = resolved.chain
+        rpc_url = resolved.rpc_url or (
+            self._settings.rpc_url if chain_id == self._settings.chain_id else KNOWN_CHAIN_RPCS.get(chain_id)
+        )
+        if not rpc_url:
+            return refuse(f"no RPC known for chain {chain_id}", chain_id)
+
+        # The recipient is whatever the receiving server will resolve — for
+        # an agent, the wallet on that agent's own Moramba record (the very
+        # source the server reads); for an address, that address. If it
+        # can't be worked out here it can't be checked, so nothing is paid.
+        if payment_to == "address":
+            expected_recipient = to_address
+        else:
+            try:
+                receiving = self._agents_client.get_receiving_agent(receiver_agent_id)
+            except Exception as exc:  # noqa: BLE001 - reported as the reason, never a crash
+                return refuse(f"could not look up receiving agent {receiver_agent_id}: {exc}", chain_id)
+            if not receiving.is_active:
+                return refuse(f"receiving agent {receiver_agent_id} is not active", chain_id)
+            expected_recipient = receiving.receive_wallet_address
+        if not expected_recipient:
+            return refuse("could not work out who this payment goes to", chain_id)
+
+        reason = balance.insufficient_balance_reason(
+            rpc_url=rpc_url, token_address=resolved.token_address, wallet_address=self.wallet.address,
+            label=resolved.token_name or token, needed_amount=amount,
+        )
+        if reason:
+            return self.ledger.record(
+                rail="mpp", recipient=recipient, token=token, amount=amount,
+                chain_id=chain_id, status=STATUS_FAILED, reason=reason,
+            )
+
+        decimals = balance.token_decimals(rpc_url, resolved.token_address)
+        if decimals is None:
+            return self.ledger.record(
+                rail="mpp", recipient=recipient, token=token, amount=amount, chain_id=chain_id,
+                status=STATUS_FAILED, reason=f"could not read the decimals of {resolved.token_address}",
+            )
 
         result = mpp.pay(
             receiver_base_url=receiver_base_url,
             receiver_agent_id=receiver_agent_id,
             wallet=self.wallet,
             amount=amount,
-            token=token,
+            expected=mpp.MppExpectation(
+                chain_id=chain_id, token_address=resolved.token_address,
+                max_units=int(amount * (Decimal(10) ** decimals)), recipient=expected_recipient,
+            ),
             payment_via=payment_via,
             payment_to=payment_to,
             payout_agent_id=payout_agent_id,
             to_address=to_address,
+            rpc_url=rpc_url,
         )
         record = self.ledger.record(
-            rail="mpp", recipient=recipient, token=token, amount=amount,
+            rail="mpp", recipient=recipient, token=token, amount=amount, chain_id=chain_id,
             status=_status_of(result),
             tx_hash=result.tx_hash, signature=result.signature, reason=result.error,
             raw_request=result.raw_request, raw_response=result.raw_response,

@@ -21,10 +21,13 @@ def _skip_real_token_balance_check(request):
     for module, _ in originals:
         module.check_wallet_token_balance = lambda *args, **kwargs: None
     original_reason = balance.insufficient_balance_reason
+    original_decimals = balance.token_decimals
     balance.insufficient_balance_reason = lambda **kwargs: None
+    balance.token_decimals = lambda rpc_url, token_address: 6
     try:
         yield
     finally:
         for module, original in originals:
             module.check_wallet_token_balance = original
         balance.insufficient_balance_reason = original_reason
+        balance.token_decimals = original_decimals
