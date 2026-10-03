@@ -521,7 +521,7 @@ class Agent:
 
         result = ap2.settle_autonomous_checkout(
             base_url=self._settings.moramba_api_base_url, api_key=key, agent_id=self._settings.moramba_agent_id,
-            wallet=self.wallet, session=session, buyer_email=buyer_email,
+            wallet=self.wallet, session=session, buyer_email=buyer_email, buyer=buyer,
         )
         record = self.ledger.record(
             rail="ap2", recipient=recipient, token=session.currency, amount=amount,

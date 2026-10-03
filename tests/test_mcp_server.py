@@ -347,3 +347,55 @@ def test_pay_payin_tool_settles(tmp_path):
     finally:
         mcp_server._agent = None
         agent.close()
+
+
+def test_pay_via_ap2_tool_passes_the_buyer_and_delivery_address_to_the_engine(tmp_path):
+    """The tool used to take only items and an email, so a buyer's phone
+    number and address could never reach the order."""
+    from decimal import Decimal
+
+    agent = make_agent(tmp_path)
+    record = agent.ledger.record(
+        rail="ap2", recipient="coffee-1", token="USD", amount=Decimal("1.5"), status=STATUS_SETTLED, tx_hash="0xok",
+    )
+    buyer = {"full_name": "Azahar Sheikh", "phone_number": "9821088878"}
+    address = {"line1": "12 Main Road", "city": "Airoli", "postal_code": "400708", "country": "IN"}
+    mcp_server._agent = agent
+    try:
+        with patch.object(agent, "pay_via_ap2", return_value=record) as mock_pay:
+            result = _call(
+                "pay_via_ap2",
+                {
+                    "items": [{"id": "coffee-1"}], "buyer_email": "a@example.com",
+                    "buyer": buyer, "delivery_address": address,
+                },
+            )
+    finally:
+        mcp_server._agent = None
+        agent.close()
+
+    assert result["status"] == STATUS_SETTLED
+    kwargs = mock_pay.call_args.kwargs
+    assert kwargs["buyer"] == buyer
+    assert kwargs["delivery_address"] == address
+    assert kwargs["buyer_email"] == "a@example.com"
+    assert kwargs["items"] == [{"id": "coffee-1"}]
+
+
+def test_pay_via_ap2_tool_still_works_with_only_items_and_an_email(tmp_path):
+    from decimal import Decimal
+
+    agent = make_agent(tmp_path)
+    record = agent.ledger.record(
+        rail="ap2", recipient="coffee-1", token="USD", amount=Decimal("1"), status=STATUS_SETTLED,
+    )
+    mcp_server._agent = agent
+    try:
+        with patch.object(agent, "pay_via_ap2", return_value=record) as mock_pay:
+            _call("pay_via_ap2", {"items": [{"id": "coffee-1"}], "buyer_email": "a@example.com"})
+    finally:
+        mcp_server._agent = None
+        agent.close()
+
+    assert mock_pay.call_args.kwargs["buyer"] is None
+    assert mock_pay.call_args.kwargs["delivery_address"] is None

@@ -134,11 +134,26 @@ def pay_via_x402(url: str, method: str = "GET", token_decimals: int = 6) -> dict
 
 
 @mcp.tool()
-def pay_via_ap2(items: list[dict], buyer_email: str, api_key: str | None = None) -> dict:
+def pay_via_ap2(
+    items: list[dict],
+    buyer_email: str,
+    buyer: dict | None = None,
+    delivery_address: dict | None = None,
+    api_key: str | None = None,
+) -> dict:
     """Autonomously complete a Moramba ACP checkout via AP2 — no human
     present. `items` is the same shape `create_checkout_session` takes,
-    e.g. [{"id": "<pay_button_id>"}]."""
-    record = _get_agent().pay_via_ap2(items=items, buyer_email=buyer_email, api_key=api_key)
+    e.g. [{"id": "<pay_button_id>"}].
+
+    Pass `buyer` (e.g. {"full_name": "...", "phone_number": "..."}) and
+    `delivery_address` (e.g. {"line1": "...", "city": "...",
+    "postal_code": "...", "country": "..."}) whenever the buyer gave them:
+    they are saved on the order, and without them the order has no contact
+    number or address. `buyer_email` is used as the buyer's email.
+    """
+    record = _get_agent().pay_via_ap2(
+        items=items, buyer_email=buyer_email, buyer=buyer, delivery_address=delivery_address, api_key=api_key,
+    )
     return _record_to_dict(record)
 
 

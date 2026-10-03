@@ -435,3 +435,29 @@ def test_selected_payment_option_prefers_the_selected_destination_over_a_same_na
     assert ap2.selected_payment_option(data, "PATHUSD")["token_address"] == "0xB"
     assert ap2.selected_payment_option({"payment_options": data["payment_options"]}, "PATHUSD")["token_address"] == "0xA"
     assert ap2.selected_payment_option({}, "PATHUSD") is None
+
+
+@respx.mock
+def test_pay_via_ap2_passes_the_buyer_through_to_completion(tmp_path):
+    """The phone number given when the checkout started has to reach the
+    /complete call, which would otherwise replace it with nothing."""
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "USD"}])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    session = ap2.CheckoutSession(session_id="sess-1", amount="500", currency="USD", decimals=2, raw={})
+    ok = ap2.Ap2SettlementResult(success=True, tx_hash="0xok", flow="plain", payin_id="payin-1", chain_id=42431)
+    buyer = {"email": "a@example.com", "full_name": "Azahar Sheikh", "phone_number": "9821088878"}
+
+    agent = Agent(settings)
+    try:
+        with patch.object(ap2, "create_checkout_session", return_value=session), \
+             patch.object(ap2, "settle_autonomous_checkout", return_value=ok) as mock_settle:
+            agent.pay_via_ap2(items=[{"id": "coffee-1"}], buyer_email="a@example.com", buyer=buyer)
+    finally:
+        agent.close()
+
+    assert mock_settle.call_args.kwargs["buyer"] == buyer
+    assert mock_settle.call_args.kwargs["buyer_email"] == "a@example.com"
