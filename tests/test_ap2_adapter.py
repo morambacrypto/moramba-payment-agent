@@ -514,3 +514,42 @@ def test_settle_autonomous_checkout_a_settled_payment_is_never_pending_even_if_c
     assert not result.success
     assert not result.pending  # the on-chain outcome was confirmed — it's the completion call that failed
     assert "server error" in result.error
+
+
+def test_complete_buyer_is_just_the_email_when_no_buyer_was_given():
+    assert ap2._complete_buyer("a@example.com", None) == {"email": "a@example.com"}
+
+
+def test_complete_buyer_keeps_the_phone_and_name_given_at_checkout():
+    """Found live: /complete replaces the saved buyer, so sending only an
+    email erased the buyer's phone number from a finished order."""
+    sent = ap2._complete_buyer(
+        "a@example.com", {"email": "a@example.com", "full_name": "Azahar Sheikh", "phone_number": "9821088878"}
+    )
+    assert sent == {"email": "a@example.com", "full_name": "Azahar Sheikh", "phone_number": "9821088878"}
+
+
+def test_complete_buyer_builds_full_name_from_first_and_last_and_fills_a_missing_email():
+    sent = ap2._complete_buyer("fallback@example.com", {"first_name": "Azahar", "last_name": "Sheikh", "phone_number": "98"})
+    assert sent["email"] == "fallback@example.com"
+    assert sent["full_name"] == "Azahar Sheikh"
+    assert sent["phone_number"] == "98"
+
+
+def test_complete_buyer_drops_empty_values_but_never_the_given_email():
+    sent = ap2._complete_buyer("a@example.com", {"email": "", "phone_number": None, "full_name": ""})
+    assert sent == {"email": "a@example.com"}
+
+
+@respx.mock
+def test_complete_checkout_session_sends_the_full_buyer_including_phone():
+    route = respx.post(f"{BASE_URL}/acp/checkout_sessions/sess-1/complete").mock(
+        return_value=httpx.Response(200, json={"status": "completed"})
+    )
+    ap2.complete_checkout_session(
+        BASE_URL, API_KEY, "sess-1", "a@example.com",
+        buyer={"email": "a@example.com", "full_name": "Azahar Sheikh", "phone_number": "9821088878"},
+    )
+    assert json.loads(route.calls[0].request.content)["buyer"] == {
+        "email": "a@example.com", "full_name": "Azahar Sheikh", "phone_number": "9821088878",
+    }

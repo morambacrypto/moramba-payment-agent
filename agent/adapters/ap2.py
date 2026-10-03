@@ -243,13 +243,31 @@ def start_checkout_payment(base_url: str, api_key: str, session_id: str, timeout
     return payin_id
 
 
+def _complete_buyer(buyer_email: str, buyer: dict[str, Any] | None) -> dict[str, Any]:
+    """The buyer to send with `/complete`. That call REPLACES the session's
+    saved buyer (a missing field is cleared, not kept), so sending only an
+    email erased the phone number given at checkout — found live, a
+    finished order had lost it. Send back everything that was given when
+    the session was created; the email argument fills in only if the buyer
+    dict has none. The backend stores one name, `full_name`, so it is built
+    from first/last name when that isn't given."""
+    sent = {k: v for k, v in (buyer or {}).items() if v}
+    sent.setdefault("email", buyer_email)
+    if "full_name" not in sent:
+        full = " ".join(p for p in (sent.get("first_name"), sent.get("last_name")) if p)
+        if full:
+            sent["full_name"] = full
+    return sent
+
+
 def complete_checkout_session(
-    base_url: str, api_key: str, session_id: str, buyer_email: str, timeout: float = 20.0
+    base_url: str, api_key: str, session_id: str, buyer_email: str, timeout: float = 20.0,
+    buyer: dict[str, Any] | None = None,
 ) -> dict:
     return _acp_request(
         base_url, api_key, f"/checkout_sessions/{session_id}/complete", "POST",
         {
-            "buyer": {"email": buyer_email},
+            "buyer": _complete_buyer(buyer_email, buyer),
             "payment_data": {
                 "handler_id": "moramba_ap2_mandate",
                 "instrument": {"type": "moramba_ap2_mandate", "credential": {"type": "receipt_token", "token": "paid"}},
@@ -622,6 +640,7 @@ def settle_autonomous_checkout(
     wallet: Wallet,
     session: CheckoutSession,
     buyer_email: str,
+    buyer: dict[str, Any] | None = None,
     poll_interval_seconds: float = 4.0,
     poll_timeout_seconds: float = 120.0,
 ) -> Ap2SettlementResult:
@@ -657,7 +676,7 @@ def settle_autonomous_checkout(
             )
 
         try:
-            complete_checkout_session(base_url, api_key, session.session_id, buyer_email)
+            complete_checkout_session(base_url, api_key, session.session_id, buyer_email, buyer=buyer)
         except Ap2Error as exc:
             # Found live (2026-10-01): by the time the on-chain payment is
             # confirmed, Moramba has already completed the session itself
