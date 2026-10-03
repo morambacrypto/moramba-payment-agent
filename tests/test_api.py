@@ -47,7 +47,7 @@ def authed_client(**kwargs):
     fields in cwd), so it's set explicitly here, after startup, the same
     way `api._agent` is overridden elsewhere in this file. Extra kwargs
     (e.g. `base_url`) pass straight through to `TestClient`."""
-    with TestClient(api.app, headers={"Authorization": f"Bearer {TEST_API_KEY}"}, **kwargs) as client:
+    with TestClient(api.app, headers={"X-API-Key": TEST_API_KEY}, **kwargs) as client:
         api._api_key = TEST_API_KEY
         yield client
 
@@ -116,8 +116,8 @@ def test_request_rejected_without_a_matching_api_key_when_one_is_configured(tmp_
         with TestClient(api.app) as client:
             api._api_key = "secret-123"
             no_header = client.get("/payment-agent-api/health")
-            wrong_header = client.get("/payment-agent-api/health", headers={"Authorization": "Bearer wrong"})
-            right_header = client.get("/payment-agent-api/health", headers={"Authorization": "Bearer secret-123"})
+            wrong_header = client.get("/payment-agent-api/health", headers={"X-API-Key": "wrong"})
+            right_header = client.get("/payment-agent-api/health", headers={"X-API-Key": "secret-123"})
         assert no_header.status_code == 401
         assert wrong_header.status_code == 401
         assert right_header.status_code == 200
@@ -156,21 +156,26 @@ def _health(headers, key="secret-123"):
         api._api_key = None
 
 
-def test_the_key_is_also_accepted_as_an_x_api_key_header():
+def test_the_key_is_accepted_in_the_x_api_key_header():
     assert _health({"X-API-Key": "secret-123"}).status_code == 200
 
 
-def test_bearer_still_works_and_its_scheme_is_case_insensitive():
-    assert _health({"Authorization": "Bearer secret-123"}).status_code == 200
-    assert _health({"Authorization": "bearer secret-123"}).status_code == 200
+def test_the_header_name_is_case_insensitive_and_surrounding_spaces_are_ignored():
+    assert _health({"x-api-key": "secret-123"}).status_code == 200
+    assert _health({"X-API-KEY": "  secret-123  "}).status_code == 200
+
+
+def test_authorization_bearer_is_no_longer_accepted_even_with_the_right_key():
+    assert _health({"Authorization": "Bearer secret-123"}).status_code == 401
+    assert _health({"Authorization": "secret-123"}).status_code == 401
 
 
 def test_a_wrong_x_api_key_is_refused():
     assert _health({"X-API-Key": "wrong"}).status_code == 401
 
 
-def test_a_bare_key_in_authorization_without_bearer_is_still_refused():
-    assert _health({"Authorization": "secret-123"}).status_code == 401
+def test_the_right_key_in_x_api_key_wins_even_with_a_stray_authorization_header():
+    assert _health({"X-API-Key": "secret-123", "Authorization": "Bearer something-else"}).status_code == 200
 
 
 def test_non_ascii_header_text_is_a_401_not_a_server_error():
@@ -182,12 +187,10 @@ def test_non_ascii_header_text_is_a_401_not_a_server_error():
 @pytest.mark.parametrize(
     "headers, expected_in_log",
     [
-        ({}, "no Authorization or X-API-Key header was sent"),
-        ({"Authorization": "secret-123"}, "without the 'Bearer ' prefix"),
-        ({"Authorization": "Authorization: Bearer secret-123"}, "header name must not be repeated"),
-        ({"Authorization": "Basic abc"}, "not a 'Bearer <key>' value"),
-        ({"Authorization": "Bearer short"}, "the Bearer key is 5 characters, expected 10"),
-        ({"Authorization": "Bearer secret-999"}, "right length but does not match"),
+        ({}, "no X-API-Key header was sent"),
+        ({"Authorization": "Bearer secret-123"}, "the key is only read from X-API-Key"),
+        ({"X-API-Key": "Bearer secret-123"}, "starts with 'Bearer ' — send the bare key"),
+        ({"X-API-Key": "X-API-Key: secret-123"}, "header name must not be repeated"),
         ({"X-API-Key": "short"}, "the X-API-Key value is 5 characters, expected 10"),
         ({"X-API-Key": "secret-999"}, "X-API-Key value has the right length but does not match"),
     ],
@@ -207,7 +210,7 @@ def test_a_refusal_is_logged_with_its_reason_and_never_with_any_key(headers, exp
 
 def test_an_unconfigured_service_says_so_in_the_log(caplog):
     with caplog.at_level(logging.WARNING, logger="agent.api"):
-        response = _health({"Authorization": "Bearer anything"}, key=None)
+        response = _health({"X-API-Key": "anything"}, key=None)
 
     assert response.status_code == 401
     assert "no PAYMENT_AGENT_API_KEY configured" in caplog.text

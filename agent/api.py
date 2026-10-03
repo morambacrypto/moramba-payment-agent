@@ -145,46 +145,32 @@ def _same(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode("utf-8", "replace"), b.encode("utf-8", "replace"))
 
 
-def _presented_keys(request: Request) -> list[str]:
-    """Every key the caller sent: the token of an `Authorization: Bearer`
-    header and/or an `X-API-Key` header. Both are accepted — some clients'
-    "add a header" boxes (Claude's web app among them) suggest an API-key
-    style header, and the key is equally secret either way."""
-    keys = []
-    scheme, _, token = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() == "bearer" and token.strip():
-        keys.append(token.strip())
-    x_api_key = request.headers.get("x-api-key", "").strip()
-    if x_api_key:
-        keys.append(x_api_key)
-    return keys
+def _presented_key(request: Request) -> str:
+    """The key the caller sent: the value of the `X-API-Key` header, and
+    only that. `Authorization` (Bearer or otherwise) is deliberately not
+    read — one header, one format, so there is a single thing to get
+    right when pasting a key into a client's "add a header" box."""
+    return request.headers.get("x-api-key", "").strip()
 
 
 def _auth_failure_reason(request: Request, expected: str | None) -> str:
     """Why a request was refused, for the server's own log only — never
     sent back to the caller, and never containing any part of a key (a
-    bare key typed into `Authorization` would otherwise show up here as
-    its "scheme")."""
+    key put in the wrong header, or wrapped in extra text, would otherwise
+    show up here)."""
     if not expected:
         return "this service has no PAYMENT_AGENT_API_KEY configured"
-    auth = request.headers.get("authorization", "")
-    x_api_key = request.headers.get("x-api-key", "").strip()
-    if not auth and not x_api_key:
-        return "no Authorization or X-API-Key header was sent"
-    if auth:
-        if _same(auth.strip(), expected):
-            return "Authorization carries the key without the 'Bearer ' prefix"
-        if auth.lower().startswith("authorization:"):
-            return "the Authorization value starts with 'Authorization:' — the header name must not be repeated in the value"
-        scheme, _, token = auth.partition(" ")
-        if scheme.lower() != "bearer":
-            return "Authorization is not a 'Bearer <key>' value"
-        token = token.strip()
-        if len(token) != len(expected):
-            return f"the Bearer key is {len(token)} characters, expected {len(expected)} — partly copied or a different key"
-        return "the Bearer key has the right length but does not match — a different or mistyped key"
-    if len(x_api_key) != len(expected):
-        return f"the X-API-Key value is {len(x_api_key)} characters, expected {len(expected)} — partly copied or a different key"
+    given = _presented_key(request)
+    if not given:
+        if request.headers.get("authorization"):
+            return "an Authorization header was sent, but the key is only read from X-API-Key — Authorization (including Bearer) is not accepted"
+        return "no X-API-Key header was sent"
+    if given.lower().startswith("x-api-key:"):
+        return "the X-API-Key value starts with 'X-API-Key:' — the header name must not be repeated in the value"
+    if given.lower().startswith("bearer "):
+        return "the X-API-Key value starts with 'Bearer ' — send the bare key, with no prefix"
+    if len(given) != len(expected):
+        return f"the X-API-Key value is {len(given)} characters, expected {len(expected)} — partly copied or a different key"
     return "the X-API-Key value has the right length but does not match — a different or mistyped key"
 
 
@@ -199,10 +185,10 @@ async def require_api_key(request: Request, call_next):
     all) must mean nothing gets in, not that auth silently stops being
     checked — this is the one thing standing between "I have this
     service's URL" and "I can call its payment routes" once TUNNEL=1
-    makes that URL public. The key may be sent as `Authorization: Bearer
-    <key>` or as `X-API-Key: <key>`. A refusal is logged with its reason
-    (see `_auth_failure_reason`); the caller only ever gets a generic 401."""
-    if _api_key and any(_same(key, _api_key) for key in _presented_keys(request)):
+    makes that URL public. The key is read from the `X-API-Key` header
+    only. A refusal is logged with its reason (see
+    `_auth_failure_reason`); the caller only ever gets a generic 401."""
+    if _api_key and _same(_presented_key(request), _api_key):
         return await call_next(request)
     logger.warning("401 %s %s: %s", request.method, request.url.path, _auth_failure_reason(request, _api_key))
     return JSONResponse({"detail": "missing or invalid API key"}, status_code=401)
