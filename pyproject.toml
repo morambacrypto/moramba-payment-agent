@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moramba-payment-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "Non-custodial Python payment agent for AI-driven crypto payments (AP2, x402, MPP, ERC20, Moramba Pay Button) — runs on a partner's own machine, never hands the private key to Moramba or the LLM."
 readme = "README.md"
 requires-python = ">=3.11"
