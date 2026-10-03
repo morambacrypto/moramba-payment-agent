@@ -1,6 +1,6 @@
 import pytest
 
-from agent import balance
+from agent import balance, retry
 from agent.adapters import ap2, pay_button, payin
 
 _MODULES_USING_BALANCE_CHECK = (ap2, pay_button, payin)
@@ -20,6 +20,7 @@ def _skip_real_token_balance_check(request):
     originals = [(m, m.check_wallet_token_balance) for m in _MODULES_USING_BALANCE_CHECK]
     for module, _ in originals:
         module.check_wallet_token_balance = lambda *args, **kwargs: None
+    retry.DEFAULT_DELAY = 0  # retries happen, but without real pauses
     original_reason = balance.insufficient_balance_reason
     original_decimals = balance.token_decimals
     balance.insufficient_balance_reason = lambda **kwargs: None

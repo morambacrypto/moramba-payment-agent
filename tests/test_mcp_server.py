@@ -21,7 +21,7 @@ _KEY_LIKE_SUBSTRINGS = ("private_key", "privatekey", "secret", "wallet_key")
 # The exact tool set README section 6's Surfaces table promises for the
 # MCP server.
 EXPECTED_TOOLS = {
-    "pay_via_mpp", "transfer_erc20", "pay_via_x402", "pay_via_ap2", "pay_via_pay_button", "pay_agent", "pay_payin",
+    "pay_via_mpp", "pay_via_mpp_url", "transfer_erc20", "pay_via_x402", "pay_via_ap2", "pay_via_pay_button", "pay_agent", "pay_payin",
     "check_spend_limits", "list_payments",
 }
 
@@ -399,3 +399,46 @@ def test_pay_via_ap2_tool_still_works_with_only_items_and_an_email(tmp_path):
 
     assert mock_pay.call_args.kwargs["buyer"] is None
     assert mock_pay.call_args.kwargs["delivery_address"] is None
+
+
+def _url_payment(agent, **overrides):
+    from decimal import Decimal
+
+    record = agent.ledger.record(
+        rail="mpp", recipient="0x" + "55" * 20, token="USDC", amount=Decimal("1"), status=STATUS_SETTLED,
+        tx_hash="0xurltx", chain_id=42431,
+    )
+    return engine_module.UrlPayment(record, **overrides)
+
+
+def test_pay_via_mpp_url_tool_returns_the_payment_and_the_content_it_bought(tmp_path):
+    agent = make_agent(tmp_path)
+    content = {"status_code": 200, "content_type": "application/json", "body": '{"secret": 1}', "truncated": False}
+    mcp_server._agent = agent
+    try:
+        with patch.object(agent, "pay_via_mpp_url", return_value=_url_payment(agent, content=content)) as mock_pay:
+            result = _call("pay_via_mpp_url", {"url": "https://paid.example/x"})
+    finally:
+        mcp_server._agent = None
+        agent.close()
+
+    assert result["status"] == STATUS_SETTLED
+    assert result["tx_hash"] == "0xurltx"
+    assert result["content"] == content
+    assert mock_pay.call_args.kwargs == {"url": "https://paid.example/x", "method": "GET", "body": None}
+
+
+def test_pay_via_mpp_url_tool_says_so_when_the_url_was_free(tmp_path):
+    agent = make_agent(tmp_path)
+    free = engine_module.UrlPayment(None, {"status_code": 200, "body": "hi"}, "resource did not require payment")
+    mcp_server._agent = agent
+    try:
+        with patch.object(agent, "pay_via_mpp_url", return_value=free):
+            result = _call("pay_via_mpp_url", {"url": "https://free.example/x", "method": "POST", "body": {"a": 1}})
+    finally:
+        mcp_server._agent = None
+        agent.close()
+
+    assert result["paid"] is False
+    assert result["detail"] == "resource did not require payment"
+    assert result["content"]["body"] == "hi"
