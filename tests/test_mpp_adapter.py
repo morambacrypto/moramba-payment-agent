@@ -310,3 +310,289 @@ def test_the_real_tempo_method_inside_the_guard_matches_charge_and_ignores_other
     )
     with pytest.raises(ValueError, match="No compatible payment method"):
         runtime.match_challenge([session])
+
+
+# ─── paying a URL directly ──────────────────────────────────────────────────
+
+from tests.mpp_helpers import (  # noqa: E402
+    PAID_URL, PAYEE, TOKEN as URL_TOKEN, challenge as url_challenge, install_fake_tempo, paid_content_server,
+    www_authenticate,
+)
+
+
+def url_expected(**overrides) -> mpp.MppExpectation:
+    values = dict(chain_id=42431, token_address=URL_TOKEN, max_units=1_000_000, recipient=PAYEE)
+    values.update(overrides)
+    return mpp.MppExpectation(**values)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://paid.example/x", "ftp://paid.example/x", "https://localhost/x", "https://api.localhost/x",
+        "https://printer.local/x", "https://metadata.internal/x", "https://127.0.0.1/x", "https://10.0.0.5/x",
+        "https://192.168.1.10/x", "https://169.254.169.254/latest/meta-data", "https://[::1]/x", "https:///nohost",
+    ],
+)
+def test_unsafe_urls_are_refused(url):
+    assert mpp.refuse_unsafe_url(url) is not None
+
+
+@pytest.mark.parametrize("url", ["https://paid.example/x", "https://crypto.moramba.io/mppx/pay/api/paid-content", "https://8.8.8.8/x"])
+def test_public_https_urls_are_allowed(url):
+    assert mpp.refuse_unsafe_url(url) is None
+
+
+@respx.mock
+def test_probe_reads_the_price_without_paying():
+    paid_content_server(challenges=[url_challenge(amount="1000000")])
+
+    probe = mpp.probe_url(PAID_URL)
+
+    assert probe.payment_required
+    assert probe.challenge == mpp.MppUrlChallenge(chain_id=42431, currency=URL_TOKEN, recipient=PAYEE, amount_units=1_000_000)
+    assert probe.note is None
+
+
+@respx.mock
+def test_probe_of_a_free_url_says_no_payment_is_needed_and_returns_its_content():
+    respx.get(PAID_URL).mock(return_value=httpx.Response(200, json={"free": True}))
+
+    probe = mpp.probe_url(PAID_URL)
+
+    assert not probe.payment_required
+    assert probe.challenge is None
+    assert json.loads(probe.content["body"]) == {"free": True}
+
+
+@respx.mock
+def test_probe_points_an_x402_url_to_the_x402_tool():
+    respx.get(PAID_URL).mock(return_value=httpx.Response(402, headers={"PAYMENT-REQUIRED": "eyJ4NDAyIjp0cnVlfQ=="}, json={}))
+
+    probe = mpp.probe_url(PAID_URL)
+
+    assert probe.payment_required and probe.challenge is None
+    assert "pay_via_x402" in probe.note
+
+
+@respx.mock
+def test_probe_names_the_methods_it_cannot_pay():
+    other = Challenge.create(
+        secret_key="s", realm="paid.example", method="stripe", intent="charge",
+        request={"amount": "100", "currency": "usd"},
+    )
+    respx.get(PAID_URL).mock(return_value=httpx.Response(402, headers={"WWW-Authenticate": other.to_www_authenticate("paid.example")}, json={}))
+
+    probe = mpp.probe_url(PAID_URL)
+
+    assert probe.challenge is None
+    assert "stripe/charge" in probe.note
+
+
+@respx.mock
+def test_probe_does_not_follow_redirects():
+    respx.get(PAID_URL).mock(return_value=httpx.Response(302, headers={"Location": "https://elsewhere.example/"}))
+
+    probe = mpp.probe_url(PAID_URL)
+
+    assert probe.status_code == 302 and not probe.payment_required
+
+
+@respx.mock
+def test_probe_retries_a_get_after_a_dropped_connection_then_reads_the_price():
+    route = respx.get(PAID_URL).mock(side_effect=[
+        httpx.ConnectError("dropped"),
+        httpx.Response(402, headers={"WWW-Authenticate": www_authenticate(url_challenge())}, json={}),
+    ])
+
+    probe = mpp.probe_url(PAID_URL)
+
+    assert probe.challenge is not None
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_probe_retries_a_get_when_the_server_is_busy():
+    route = respx.get(PAID_URL).mock(side_effect=[
+        httpx.Response(503),
+        httpx.Response(429),
+        httpx.Response(402, headers={"WWW-Authenticate": www_authenticate(url_challenge())}, json={}),
+    ])
+
+    assert mpp.probe_url(PAID_URL).challenge is not None
+    assert route.call_count == 3
+
+
+@respx.mock
+def test_probe_gives_up_on_a_server_that_stays_busy_and_reports_what_it_said():
+    route = respx.get(PAID_URL).mock(return_value=httpx.Response(503, text="busy"))
+
+    probe = mpp.probe_url(PAID_URL)
+
+    assert probe.status_code == 503 and not probe.payment_required
+    assert route.call_count == 3
+
+
+@respx.mock
+def test_probe_raises_after_every_attempt_to_connect_fails():
+    route = respx.get(PAID_URL).mock(side_effect=httpx.ConnectError("down"))
+
+    with pytest.raises(httpx.ConnectError):
+        mpp.probe_url(PAID_URL)
+    assert route.call_count == 3
+
+
+@respx.mock
+def test_probe_does_not_repeat_a_post_that_timed_out_because_it_may_have_run():
+    route = respx.post(PAID_URL).mock(side_effect=httpx.ReadTimeout("no answer"))
+
+    with pytest.raises(httpx.ReadTimeout):
+        mpp.probe_url(PAID_URL, method="POST", body=b"{}")
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_probe_does_repeat_a_post_whose_connection_was_never_made():
+    route = respx.post(PAID_URL).mock(side_effect=[
+        httpx.ConnectError("refused"),
+        httpx.Response(402, headers={"WWW-Authenticate": www_authenticate(url_challenge())}, json={}),
+    ])
+
+    assert mpp.probe_url(PAID_URL, method="POST", body=b"{}").challenge is not None
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_pay_url_pays_the_challenge_and_returns_the_content_and_receipt(monkeypatch):
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    fake = install_fake_tempo(monkeypatch, wallet.address)
+    route = paid_content_server(challenges=[url_challenge()], reference="0xurltx")
+
+    result = mpp.pay_url(url=PAID_URL, wallet=wallet, expected=url_expected())
+
+    assert result.success
+    assert result.tx_hash == "0xurltx"
+    assert json.loads(result.raw_response["body"]) == {"secret": "the paid content"}
+    assert result.raw_response["status_code"] == 200
+    assert route.call_count == 2  # the unpaid request, then the one carrying the credential
+    assert fake.credentials_created == 1
+
+
+@respx.mock
+def test_pay_url_refuses_a_price_that_went_up_since_the_probe(monkeypatch):
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    fake = install_fake_tempo(monkeypatch, wallet.address)
+    paid_content_server(challenges=[url_challenge(amount="9000000")])
+
+    result = mpp.pay_url(url=PAID_URL, wallet=wallet, expected=url_expected(max_units=1_000_000))
+
+    assert not result.success
+    assert "more than the 1000000 approved" in result.error
+    assert fake.credentials_created == 0
+
+
+@respx.mock
+def test_pay_url_refuses_another_payee_than_the_probe_showed(monkeypatch):
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    fake = install_fake_tempo(monkeypatch, wallet.address)
+    paid_content_server(challenges=[url_challenge(recipient="0x" + "88" * 20)])
+
+    result = mpp.pay_url(url=PAID_URL, wallet=wallet, expected=url_expected())
+
+    assert not result.success and "challenge pays" in result.error
+    assert fake.credentials_created == 0
+
+
+@respx.mock
+def test_a_url_that_keeps_asking_for_payment_is_paid_only_once(monkeypatch):
+    """pympp answers a repeated 402 with a new credential, up to three
+    times by default. A server that rejected the first payment and
+    re-challenged would be paid again — the agent allows one payment."""
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    fake = install_fake_tempo(monkeypatch, wallet.address)
+    route = respx.get(PAID_URL).mock(
+        return_value=httpx.Response(402, headers={"WWW-Authenticate": www_authenticate(url_challenge())}, json={"detail": "no"})
+    )
+
+    result = mpp.pay_url(url=PAID_URL, wallet=wallet, expected=url_expected())
+
+    assert not result.success
+    assert fake.credentials_created == 1
+    assert route.call_count == 2  # one unpaid request, one paid — never a second payment
+
+
+@respx.mock
+def test_pay_to_an_agent_is_also_paid_only_once(monkeypatch):
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    fake = install_fake_tempo(monkeypatch, wallet.address)
+    respx.post(URL).mock(
+        return_value=httpx.Response(402, headers={"WWW-Authenticate": make_challenge().to_www_authenticate("receiver.example")}, json={})
+    )
+
+    result = pay(wallet)
+
+    assert not result.success
+    assert fake.credentials_created == 1
+
+
+@respx.mock
+def test_a_lost_response_after_the_credential_is_pending_and_never_resent(monkeypatch):
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    fake = install_fake_tempo(monkeypatch, wallet.address)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(402, headers={"WWW-Authenticate": www_authenticate(url_challenge())}, json={})
+        raise httpx.ReadTimeout("no answer")
+
+    respx.get(PAID_URL).mock(side_effect=handler)
+
+    result = mpp.pay_url(url=PAID_URL, wallet=wallet, expected=url_expected())
+
+    assert not result.success and result.pending
+    assert "outcome unknown" in result.error
+    assert calls["n"] == 2 and fake.credentials_created == 1
+
+
+@respx.mock
+def test_pay_url_reports_an_error_status_after_payment_without_claiming_success(monkeypatch):
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    install_fake_tempo(monkeypatch, wallet.address)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("authorization", "").startswith("Payment "):
+            return httpx.Response(500, text="server error")
+        return httpx.Response(402, headers={"WWW-Authenticate": www_authenticate(url_challenge())}, json={})
+
+    respx.get(PAID_URL).mock(side_effect=handler)
+
+    result = mpp.pay_url(url=PAID_URL, wallet=wallet, expected=url_expected())
+
+    assert not result.success and result.error == "HTTP 500"
+
+
+@respx.mock
+def test_pay_url_describes_binary_content_instead_of_dumping_it(monkeypatch):
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    install_fake_tempo(monkeypatch, wallet.address)
+    paid_content_server(body=b"\x89PNG\r\n", content_type="image/png")
+
+    result = mpp.pay_url(url=PAID_URL, wallet=wallet, expected=url_expected())
+
+    assert result.success
+    assert result.raw_response["body"] is None
+    assert "image/png" in result.raw_response["note"]
+
+
+@respx.mock
+def test_pay_url_cuts_very_long_content_and_says_so(monkeypatch):
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    install_fake_tempo(monkeypatch, wallet.address)
+    paid_content_server(body="x" * 50_000, content_type="text/plain")
+
+    result = mpp.pay_url(url=PAID_URL, wallet=wallet, expected=url_expected())
+
+    assert len(result.raw_response["body"]) == 20_000
+    assert result.raw_response["truncated"] is True

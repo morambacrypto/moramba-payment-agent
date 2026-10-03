@@ -5,7 +5,7 @@ x402, AP2 (Autonomous), Moramba Pay Button, Agent Transfer (pay any
 Moramba agent directly by id), and Payin (pay an existing payin_id
 directly) — plus the local ledger, the live limit check, a FastAPI
 service wrapper, the setup wizard, and the MCP tool server, all with a
-passing test suite (271 tests) — including a required `PAYMENT_AGENT_API_KEY`
+passing test suite (338 tests) — including a required `PAYMENT_AGENT_API_KEY`
 `X-API-Key` check in front of the HTTP/MCP server itself (2026-10-02),
 closing a real gap where `TUNNEL=1`'s public URL had no auth of its own.
 Packaged as a proper
@@ -39,7 +39,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 271 tests, all passing
+python -m pytest -q          # 338 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -464,6 +464,48 @@ was passed (in the token's on-chain decimals).
 
 A payment whose result is lost after the credential was sent is recorded
 as `pending` (the SDK's `PaymentOutcomeUnknownError`), not `failed`.
+
+#### Paying a URL: `pay_via_mpp_url`
+
+`pay_via_mpp` pays another Moramba agent by its id. To pay a **URL** that
+is protected by MPP (an HTTP `402` with a Tempo `WWW-Authenticate: Payment`
+challenge) there is `pay_via_mpp_url` (MCP tool, and `POST
+/payment-agent-api/pay/mpp-url` with `{url, method, body}`). It returns
+what the URL serves, in `content`, along with the payment. A URL that
+answers `402` with an x402 `PAYMENT-REQUIRED` header is rejected with a
+pointer to `pay_via_x402`.
+
+It is two-phase, like x402, because the price, token and payee are only
+known once the URL answers: an unpaid request reads the challenge, the
+limit check runs on *that*, and only then is anything signed.
+- The token must be one of this agent's own payout tokens (matched by
+  contract address), on the challenge's chain, and that chain must be
+  Tempo. Otherwise `rejected`, naming the tokens the agent does accept.
+- The payment must fit every limit (the amount, token and payee come from
+  the challenge) and the wallet must hold the token.
+- The real request is then checked against the probe: a URL that raises
+  its price or changes its payee on the second request is refused before
+  anything is signed.
+- Only `https` URLs on public addresses; no `localhost`, private,
+  loopback, link-local or reserved addresses, so the agent can't be pointed
+  at the machine or network it runs on. Only the literal host is checked —
+  there is no DNS lookup. Only `GET` and `POST`; redirects are not followed.
+- Text and JSON content comes back as text, cut at 20,000 characters
+  (`truncated: true`); anything else is described, not dumped.
+
+#### Retries
+
+Only steps that cannot spend anything are retried (up to 3 attempts, with a
+growing pause): reading the wallet's token balance and the token's
+decimals, and the unpaid request that reads a URL's price (a `GET` on a
+dropped connection or a `429`/`502`/`503`/`504`; a `POST` only when the
+connection was never made, since a `POST` that timed out may have run).
+
+**A payment is never retried.** Sending it twice could pay twice. pympp
+would, by default, answer a repeated `402` with a new credential up to
+three times; the agent allows exactly one. A payment whose result is lost
+is `pending` — for a person to check — and is never sent again
+automatically.
 
 ### Moramba Pay Button — pay an existing button by its `button_id` — done, live-tested
 A fifth rail: paying one of the partner's own Moramba Pay Buttons

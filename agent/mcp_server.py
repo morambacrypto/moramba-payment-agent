@@ -78,6 +78,8 @@ def pay_via_mpp(
 ) -> dict:
     """Pay another Moramba agent (or a raw wallet address) via MPP.
 
+    To pay a URL rather than an agent, use pay_via_mpp_url.
+
     MPP runs on the Tempo chain only: `token` is the NAME of one of this
     agent's payout tokens (e.g. "pathUSD"), and it must be a Tempo token.
     Rejected attempts are still returned (status "rejected"), not raised
@@ -131,6 +133,37 @@ def pay_via_x402(url: str, method: str = "GET", token_decimals: int = 6) -> dict
     if record is None:
         return {"paid": False, "detail": "resource did not require payment"}
     return _record_to_dict(record)
+
+
+def _url_payment_to_dict(outcome) -> dict[str, Any]:
+    """What a URL payment hands back: the payment record plus the content
+    the URL then served — the whole point of paying it."""
+    if outcome.record is None:
+        return {"paid": False, "detail": outcome.detail, "content": outcome.content}
+    result = _record_to_dict(outcome.record)
+    if outcome.content is not None:
+        result["content"] = outcome.content
+    return result
+
+
+@mcp.tool()
+def pay_via_mpp_url(url: str, method: str = "GET", body: dict | None = None) -> dict:
+    """Pay a URL protected by MPP (it answers HTTP 402 with a Tempo
+    `WWW-Authenticate: Payment` challenge) and return what it then serves,
+    in `content`. Use this when you are given a URL to pay for, not another
+    Moramba agent's id (that is pay_via_mpp). For a URL that answers 402 with
+    an x402 `PAYMENT-REQUIRED` header, use pay_via_x402 instead.
+
+    The price, token and payee come from the URL's own challenge. The token
+    must be one of this agent's payout tokens and the payment must fit
+    every limit; otherwise nothing is spent and status is "rejected" with a
+    `reason`. Only https URLs on public addresses are allowed, and only
+    GET or POST. If the URL turns out to be free, returns {"paid": false}.
+    A status of "pending" means the payment was sent but its outcome could
+    not be confirmed — check before trying again; it is never retried
+    automatically.
+    """
+    return _url_payment_to_dict(_get_agent().pay_via_mpp_url(url=url, method=method, body=body))
 
 
 @mcp.tool()

@@ -8,6 +8,8 @@ from decimal import Decimal
 
 from web3 import Web3
 
+from agent.retry import retry_call
+
 _ERC20_BALANCE_ABI = [
     {"name": "balanceOf", "inputs": [{"type": "address"}], "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"name": "decimals", "inputs": [], "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"},
@@ -33,11 +35,12 @@ def insufficient_balance_reason(
     token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=_ERC20_BALANCE_ABI)
     wallet = Web3.to_checksum_address(wallet_address)
     try:
-        balance = token.functions.balanceOf(wallet).call()
+        # Public RPCs drop a call now and then; a read costs nothing to repeat.
+        balance = retry_call(lambda: token.functions.balanceOf(wallet).call())
     except Exception as exc:  # noqa: BLE001 - reported as the failure reason
         return f"could not read token balance for {wallet}: {exc}"
     try:
-        decimals = token.functions.decimals().call()
+        decimals = retry_call(lambda: token.functions.decimals().call())
     except Exception:  # noqa: BLE001 - only optional when the amount is already in smallest units
         decimals = None
 
@@ -59,6 +62,6 @@ def token_decimals(rpc_url: str, token_address: str) -> int | None:
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=_ERC20_BALANCE_ABI)
     try:
-        return int(token.functions.decimals().call())
+        return int(retry_call(lambda: token.functions.decimals().call()))
     except Exception:  # noqa: BLE001 - the caller decides what an unreadable value means
         return None

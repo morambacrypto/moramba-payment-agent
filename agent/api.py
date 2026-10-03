@@ -248,6 +248,12 @@ class X402PayRequest(BaseModel):
     token_decimals: int = 6
 
 
+class MppUrlPayRequest(BaseModel):
+    url: str
+    method: str = "GET"
+    body: dict | None = None
+
+
 class Ap2PayRequest(BaseModel):
     items: list[dict]
     buyer_email: str
@@ -317,6 +323,17 @@ def pay_x402(req: X402PayRequest, agent: Agent = Depends(get_agent)):
     if record is None:
         return {"paid": False, "detail": "resource did not require payment"}
     return _record_to_dict(record)
+
+
+@router.post("/pay/mpp-url")
+def pay_mpp_url(req: MppUrlPayRequest, agent: Agent = Depends(get_agent)):
+    outcome = agent.pay_via_mpp_url(url=req.url, method=req.method, body=req.body)
+    if outcome.record is None:
+        return {"paid": False, "detail": outcome.detail, "content": outcome.content}
+    result = _record_to_dict(outcome.record)
+    if outcome.content is not None:
+        result["content"] = outcome.content
+    return result
 
 
 @router.post("/pay/ap2")

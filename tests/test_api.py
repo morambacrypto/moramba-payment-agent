@@ -550,3 +550,40 @@ def test_mcp_tool_server_is_reachable_on_the_same_app_at_slash_mcp(tmp_path):
     finally:
         api.app.dependency_overrides.pop(api.get_agent, None)
         agent.close()
+
+
+def test_pay_mpp_url_endpoint_returns_the_payment_and_the_content(tmp_path):
+    from decimal import Decimal
+
+    agent = make_agent(tmp_path)
+    record = agent.ledger.record(
+        rail="mpp", recipient="0x" + "55" * 20, token="USDC", amount=Decimal("1"), status=STATUS_SETTLED, tx_hash="0xurltx",
+    )
+    content = {"status_code": 200, "content_type": "text/plain", "body": "the paid content", "truncated": False}
+    api.app.dependency_overrides[api.get_agent] = lambda: agent
+    try:
+        with patch.object(agent, "pay_via_mpp_url", return_value=engine_module.UrlPayment(record, content)) as mock_pay:
+            with authed_client() as client:
+                response = client.post("/payment-agent-api/pay/mpp-url", json={"url": "https://paid.example/x", "method": "POST", "body": {"q": 1}})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == STATUS_SETTLED and body["tx_hash"] == "0xurltx"
+        assert body["content"] == content
+        assert mock_pay.call_args.kwargs == {"url": "https://paid.example/x", "method": "POST", "body": {"q": 1}}
+    finally:
+        api.app.dependency_overrides.pop(api.get_agent, None)
+        agent.close()
+
+
+def test_pay_mpp_url_endpoint_reports_a_free_url_as_not_paid(tmp_path):
+    agent = make_agent(tmp_path)
+    free = engine_module.UrlPayment(None, {"status_code": 200, "body": "hi"}, "resource did not require payment")
+    api.app.dependency_overrides[api.get_agent] = lambda: agent
+    try:
+        with patch.object(agent, "pay_via_mpp_url", return_value=free):
+            with authed_client() as client:
+                response = client.post("/payment-agent-api/pay/mpp-url", json={"url": "https://free.example/x"})
+        assert response.json() == {"paid": False, "detail": "resource did not require payment", "content": {"status_code": 200, "body": "hi"}}
+    finally:
+        api.app.dependency_overrides.pop(api.get_agent, None)
+        agent.close()

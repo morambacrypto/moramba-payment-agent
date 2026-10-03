@@ -5,6 +5,7 @@ MCP tool server (phase 6) are all thin wrappers over this class; none of
 them re-implement the limit check.
 """
 
+from dataclasses import dataclass
 from decimal import Decimal
 
 from agent import balance
@@ -55,6 +56,17 @@ def _parse_caip2_chain_id(network: str) -> int | None:
         return None
     _, _, suffix = network.partition(":")
     return int(suffix) if suffix.isdigit() else None
+
+
+@dataclass(frozen=True)
+class UrlPayment:
+    """What `Agent.pay_via_mpp_url` hands back. `record` is None when no
+    payment was needed or attempted (the URL was free) — nothing was
+    recorded. `content` is what the URL served: the payment's whole point."""
+
+    record: PaymentRecord | None
+    content: dict | None = None
+    detail: str | None = None
 
 
 class Agent:
@@ -227,6 +239,112 @@ class Agent:
         )
         self._sync_client.sync_pending(self.ledger)
         return record
+
+    def pay_via_mpp_url(self, *, url: str, method: str = "GET", body: dict | None = None) -> UrlPayment:
+        """Pay a URL protected by MPP (an HTTP 402 with a Tempo charge
+        challenge) and return what it serves. Two-phase, like x402: the
+        price, token and payee are only known once the URL answers 402, so
+        the limit check (README section 2) runs *between* the unpaid probe
+        and anything being signed. The probe's challenge is what gets
+        approved: the token has to be one of this agent's own payout
+        tokens, on the challenge's chain, within every limit; `mpp.pay_url`
+        then refuses any challenge on the real request that asks for
+        more, or for another payee.
+
+        Returns `UrlPayment(record=None)` when the URL didn't require
+        payment — not a payment attempt, so nothing is recorded."""
+        def reject(reason: str, *, chain_id: int | None = None, token: str = "unknown", amount: Decimal = Decimal("0"),
+                   recipient: str | None = None) -> UrlPayment:
+            return UrlPayment(self.ledger.record(
+                rail="mpp", recipient=recipient or url, token=token, amount=amount, chain_id=chain_id,
+                status=STATUS_REJECTED, reason=reason, raw_request={"url": url, "method": method},
+            ))
+
+        method = method.upper()
+        if method not in ("GET", "POST"):
+            return reject(f"method {method!r} is not supported — use GET or POST")
+        unsafe = mpp.refuse_unsafe_url(url)
+        if unsafe:
+            return reject(unsafe)
+
+        content_bytes = mpp.encode_body(body) if body is not None else None
+        try:
+            probe = mpp.probe_url(url, method=method, body=content_bytes)
+        except Exception as exc:  # noqa: BLE001 - still unreachable after its retries: record it, nothing was spent
+            return UrlPayment(self.ledger.record(
+                rail="mpp", recipient=url, token="unknown", amount=Decimal("0"), status=STATUS_FAILED,
+                reason=f"could not reach {url}: {type(exc).__name__}: {exc}", raw_request={"url": url, "method": method},
+            ))
+        if not probe.payment_required:
+            return UrlPayment(None, probe.content, "resource did not require payment")
+        if probe.challenge is None:
+            return reject(probe.note or "this URL asked for a payment this agent can't make")
+
+        challenge = probe.challenge
+        chain_id = challenge.chain_id
+        if chain_id not in mpp.TEMPO_CHAIN_IDS:
+            return reject(f"MPP only runs on Tempo (chains {sorted(mpp.TEMPO_CHAIN_IDS)}); this URL asks for chain {chain_id}", chain_id=chain_id)
+
+        limits = self._agents_client.get_agent(self._settings.moramba_agent_id)
+        resolved = next(
+            (t for t in limits.payout_tokens if t.token_address and t.token_address.lower() == challenge.currency.lower()),
+            None,
+        )
+        if resolved is None:
+            accepted = [t.token_name for t in limits.payout_tokens]
+            return reject(
+                f"this URL asks for token {challenge.currency}, which is not one of this agent's payout tokens — accepts: {accepted}",
+                chain_id=chain_id, recipient=challenge.recipient,
+            )
+        if resolved.chain != chain_id:
+            return reject(
+                f"this URL asks for {resolved.token_name} on chain {chain_id}, but this agent's {resolved.token_name} "
+                f"is configured for chain {resolved.chain}",
+                chain_id=chain_id, token=resolved.token_name, recipient=challenge.recipient,
+            )
+        rpc_url = resolved.rpc_url or (
+            self._settings.rpc_url if chain_id == self._settings.chain_id else KNOWN_CHAIN_RPCS.get(chain_id)
+        )
+        if not rpc_url:
+            return reject(f"no RPC known for chain {chain_id}", chain_id=chain_id, token=resolved.token_name)
+
+        decimals = balance.token_decimals(rpc_url, resolved.token_address)
+        if decimals is None:
+            return UrlPayment(self.ledger.record(
+                rail="mpp", recipient=challenge.recipient, token=resolved.token_name, amount=Decimal("0"),
+                chain_id=chain_id, status=STATUS_FAILED, reason=f"could not read the decimals of {resolved.token_address}",
+                raw_request={"url": url, "method": method},
+            ))
+        amount = Decimal(challenge.amount_units) / (Decimal(10) ** decimals)
+
+        check = self.check_spend_limits(recipient=challenge.recipient, token=resolved.token_name, amount=amount, rail="mpp")
+        if not check.allowed:
+            return reject(check.reason, chain_id=chain_id, token=resolved.token_name, amount=amount, recipient=challenge.recipient)
+
+        reason = balance.insufficient_balance_reason(
+            rpc_url=rpc_url, token_address=resolved.token_address, wallet_address=self.wallet.address,
+            label=resolved.token_name, needed_units=challenge.amount_units,
+        )
+        if reason:
+            return UrlPayment(self.ledger.record(
+                rail="mpp", recipient=challenge.recipient, token=resolved.token_name, amount=amount,
+                chain_id=chain_id, status=STATUS_FAILED, reason=reason, raw_request={"url": url, "method": method},
+            ))
+
+        result = mpp.pay_url(
+            url=url, method=method, body=content_bytes, wallet=self.wallet, rpc_url=rpc_url,
+            expected=mpp.MppExpectation(
+                chain_id=chain_id, token_address=resolved.token_address,
+                max_units=challenge.amount_units, recipient=challenge.recipient,
+            ),
+        )
+        record = self.ledger.record(
+            rail="mpp", recipient=challenge.recipient, token=resolved.token_name, amount=amount, chain_id=chain_id,
+            status=_status_of(result), tx_hash=result.tx_hash, reason=result.error,
+            raw_request=result.raw_request, raw_response=result.raw_response,
+        )
+        self._sync_client.sync_pending(self.ledger)
+        return UrlPayment(record, content=result.raw_response if result.success else None)
 
     def transfer_erc20(
         self,
