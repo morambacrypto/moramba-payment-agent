@@ -321,7 +321,10 @@ def main() -> None:
         # Same persisted value agent/api.py's lifespan will load (generated
         # here first if .env predates the field), so what's printed is
         # exactly what the service enforces.
-        print(f"PAYMENT_AGENT_API_KEY (send as header `Authorization: Bearer <key>`): {ensure_payment_agent_api_key()}")
+        print(
+            "PAYMENT_AGENT_API_KEY (send as `Authorization: Bearer <key>` or `X-API-Key: <key>`): "
+            f"{ensure_payment_agent_api_key()}"
+        )
     if not pinned_port:
         print(f"(tried preferred port {_PREFERRED_PORT} first, auto-selected otherwise — set PORT to pin a specific one instead)")
 

@@ -1,8 +1,11 @@
+import logging
 from contextlib import contextmanager
+from types import SimpleNamespace
 from decimal import Decimal
 from unittest.mock import patch
 
 import httpx
+import pytest
 import respx
 from anyio import to_thread
 from fastapi.testclient import TestClient
@@ -139,6 +142,75 @@ def test_request_rejected_without_any_header_when_no_api_key_is_configured(tmp_p
     finally:
         api.app.dependency_overrides.pop(api.get_agent, None)
         agent.close()
+
+
+def _health(headers, key="secret-123"):
+    """GET /health with the service's key set to `key` and exactly these headers."""
+    api.app.dependency_overrides[api.get_agent] = lambda: SimpleNamespace(wallet=SimpleNamespace(address="0xabc"))
+    try:
+        with TestClient(api.app) as client:
+            api._api_key = key
+            return client.get("/payment-agent-api/health", headers=headers)
+    finally:
+        api.app.dependency_overrides.pop(api.get_agent, None)
+        api._api_key = None
+
+
+def test_the_key_is_also_accepted_as_an_x_api_key_header():
+    assert _health({"X-API-Key": "secret-123"}).status_code == 200
+
+
+def test_bearer_still_works_and_its_scheme_is_case_insensitive():
+    assert _health({"Authorization": "Bearer secret-123"}).status_code == 200
+    assert _health({"Authorization": "bearer secret-123"}).status_code == 200
+
+
+def test_a_wrong_x_api_key_is_refused():
+    assert _health({"X-API-Key": "wrong"}).status_code == 401
+
+
+def test_a_bare_key_in_authorization_without_bearer_is_still_refused():
+    assert _health({"Authorization": "secret-123"}).status_code == 401
+
+
+def test_non_ascii_header_text_is_a_401_not_a_server_error():
+    # Sent as raw bytes: httpx will not encode a non-ASCII str header, but
+    # a real client on the wire can send exactly this.
+    assert _health({"X-API-Key": b"caf\xe9-key"}).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "headers, expected_in_log",
+    [
+        ({}, "no Authorization or X-API-Key header was sent"),
+        ({"Authorization": "secret-123"}, "without the 'Bearer ' prefix"),
+        ({"Authorization": "Authorization: Bearer secret-123"}, "header name must not be repeated"),
+        ({"Authorization": "Basic abc"}, "not a 'Bearer <key>' value"),
+        ({"Authorization": "Bearer short"}, "the Bearer key is 5 characters, expected 10"),
+        ({"Authorization": "Bearer secret-999"}, "right length but does not match"),
+        ({"X-API-Key": "short"}, "the X-API-Key value is 5 characters, expected 10"),
+        ({"X-API-Key": "secret-999"}, "X-API-Key value has the right length but does not match"),
+    ],
+)
+def test_a_refusal_is_logged_with_its_reason_and_never_with_any_key(headers, expected_in_log, caplog):
+    with caplog.at_level(logging.WARNING, logger="agent.api"):
+        response = _health(headers)
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "missing or invalid API key"}  # the caller learns nothing more
+    assert expected_in_log in caplog.text
+    assert "GET /payment-agent-api/health" in caplog.text
+    # No part of the real key, nor of what was typed, appears in the log.
+    for secret in ("secret-123", "secret-999", "abc"):
+        assert secret not in caplog.text
+
+
+def test_an_unconfigured_service_says_so_in_the_log(caplog):
+    with caplog.at_level(logging.WARNING, logger="agent.api"):
+        response = _health({"Authorization": "Bearer anything"}, key=None)
+
+    assert response.status_code == 401
+    assert "no PAYMENT_AGENT_API_KEY configured" in caplog.text
 
 
 def test_lifespan_raises_thread_pool_limit_above_anyios_default(tmp_path, monkeypatch):
