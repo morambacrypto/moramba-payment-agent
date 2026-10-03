@@ -78,8 +78,13 @@ def pay_via_mpp(
 ) -> dict:
     """Pay another Moramba agent (or a raw wallet address) via MPP.
 
+    MPP runs on the Tempo chain only: `token` is the NAME of one of this
+    agent's payout tokens (e.g. "pathUSD"), and it must be a Tempo token.
     Rejected attempts are still returned (status "rejected"), not raised
-    as errors, with `reason` explaining which limit stopped it.
+    as errors, with `reason` explaining what stopped it (a limit, a
+    non-Tempo token, a payment challenge that didn't match what was
+    approved). A status of "pending" means the payment was sent but its
+    outcome couldn't be confirmed — check before retrying.
     """
     record = _get_agent().pay_via_mpp(
         receiver_base_url=receiver_base_url,

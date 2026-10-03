@@ -10,3 +10,6 @@ class PaymentResult:
     raw_request: dict[str, Any] | None = None
     raw_response: dict[str, Any] | None = None
     error: str | None = None
+    # True when the payment was sent but its outcome couldn't be confirmed —
+    # `success=False` there does not mean it failed.
+    pending: bool = False

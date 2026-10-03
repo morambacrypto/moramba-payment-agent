@@ -5,7 +5,7 @@ x402, AP2 (Autonomous), Moramba Pay Button, Agent Transfer (pay any
 Moramba agent directly by id), and Payin (pay an existing payin_id
 directly) — plus the local ledger, the live limit check, a FastAPI
 service wrapper, the setup wizard, and the MCP tool server, all with a
-passing test suite (233 tests) — including a required `PAYMENT_AGENT_API_KEY`
+passing test suite (257 tests) — including a required `PAYMENT_AGENT_API_KEY`
 bearer-token check in front of the HTTP/MCP server itself (2026-10-02),
 closing a real gap where `TUNNEL=1`'s public URL had no auth of its own.
 Packaged as a proper
@@ -39,7 +39,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 233 tests, all passing
+python -m pytest -q          # 257 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -398,32 +398,60 @@ also applies its own `spend_controls` (default-assets allowlist, a
 per-payment cap) as a second, independent safety net before our check
 ever runs.
 
-### MPP — matches `mppx-agent-endpoint-server-ts` exactly
-Verified by reading that sibling project's actual source (not its README,
-which is out of date):
+### MPP — on Tempo only, built on the official `pympp` SDK
+MPP here runs on **Tempo only** (mainnet 4217, testnet 42431). The rail
+uses the official Python SDK (`pympp[tempo]`, github.com/tempoxyz/pympp)
+against `mppx-agent-endpoint-server-ts`, whose actual source and
+mpp.dev's docs (the Tempo charge intent, the security and split-payment
+guides) were read to write it. The real flow:
 
-1. Sign the **fixed string** `"I am doing transaction with this account"`
-   with the local wallet key (EIP-191 personal-sign).
-2. `POST` to `/agent-api/payout/agent/:agent_id/pay` (or
-   `/agent-api/receiver/agent/:agent_id/pay` — both routes hit the same
-   handler; `:agent_id` in the URL is always the **receiver's** agent id):
+1. `POST` to `/agent-api/payout/agent/:agent_id/pay` (or
+   `/agent-api/receiver/agent/:agent_id/pay` — same handler; `:agent_id`
+   is always the **receiver's** agent id) with:
    ```json
    {
      "payment_via": "agent",
      "payment_to": "agent",
      "payout_agent_id": "...",
      "to_address": "...",
-     "amount": "...",
-     "token": "...",
+     "amount": "2.5",
+     "token": "0x20c0…",
      "signature": "0x..."
    }
    ```
-3. The receiving server resolves the recipient, checks its own limits,
-   and — when `payment_via` is `"agent"` — pulls the payer agent's
-   record straight from Moramba's existing
-   `GET /api/v2/morambacrypto/public/agent` endpoint and re-checks
-   *those* limits too. Our agent doesn't need to duplicate that check on
-   the receiving side — only on the sending side, before it ever signs.
+   `amount` is in human units. `token` must be the token's **contract
+   address** — the server matches it against an allow-list of addresses
+   and uses it as the challenge currency; a name like `"USDC"` is
+   rejected. `signature` is the EIP-191 signature of the fixed string
+   `"I am doing transaction with this account"`.
+2. The server runs its checks and answers `402` with a Challenge in
+   `WWW-Authenticate` (amount in smallest units, currency, recipient,
+   chain id).
+3. The SDK signs a TIP-20 `transfer` for exactly that challenge and
+   retries the same `POST` with it as the `Authorization` credential.
+4. The server broadcasts the transaction, verifies it, and returns a
+   Receipt (`Payment-Receipt`), whose reference is the tx hash.
+
+**The SDK pays whatever a challenge demands, and its event hooks can't
+veto a payment**, so the agent checks every challenge itself, in
+`agent/adapters/mpp.py`'s `validate_challenge`, *before anything is
+signed*: it must be a Tempo `charge`; on the chain, token contract and
+recipient that were approved; for no more than the approved amount; with
+no `splits`; and, if the server bound it to the request body with a
+`digest`, with a digest that matches the body actually sent. Anything
+else signs and sends nothing (`MPP challenge refused: ...`). Session and
+subscription challenges are never matched.
+
+What is approved comes from `pay_via_mpp` (`agent/engine.py`), which
+rejects the payment unless: the agent's payout token for `token` has a
+contract address on record; it is on a Tempo chain; and the recipient can
+be worked out — the receiving agent's own wallet from Moramba's record
+(the same source the server reads), or the `to_address` given. It also
+checks the wallet's token balance first, and caps the amount at what
+was passed (in the token's on-chain decimals).
+
+A payment whose result is lost after the credential was sent is recorded
+as `pending` (the SDK's `PaymentOutcomeUnknownError`), not `failed`.
 
 ### Moramba Pay Button — pay an existing button by its `button_id` — done, live-tested
 A fifth rail: paying one of the partner's own Moramba Pay Buttons

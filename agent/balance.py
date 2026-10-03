@@ -52,3 +52,13 @@ def insufficient_balance_reason(
         return str(Decimal(units) / (Decimal(10) ** decimals)) if decimals is not None else f"{units} (smallest units)"
 
     return f"insufficient token balance: wallet {wallet} has {show(balance)} {label}, needs {show(needed_units)} — fund it first"
+
+
+def token_decimals(rpc_url: str, token_address: str) -> int | None:
+    """The token's own on-chain `decimals`, or `None` if it can't be read."""
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=_ERC20_BALANCE_ABI)
+    try:
+        return int(token.functions.decimals().call())
+    except Exception:  # noqa: BLE001 - the caller decides what an unreadable value means
+        return None
