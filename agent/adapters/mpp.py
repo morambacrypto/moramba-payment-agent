@@ -192,6 +192,18 @@ def _failure_result(exc: Exception, signature: str | None, raw_request: dict | N
     return PaymentResult(success=False, signature=signature, raw_request=raw_request, error=f"{type(exc).__name__}: {exc}")
 
 
+def _problem_detail(resp) -> str | None:
+    """The reason in an error body, if it has one. MPP errors are RFC 9457
+    "Problem Details" (`title`, `detail`), so a failed payment can say why
+    instead of only "HTTP 402". Cut short, and only text from the body."""
+    body = _safe_json(resp)
+    if not body:
+        return None
+    title, detail = body.get("title"), body.get("detail")
+    parts = [p for p in (title, detail) if isinstance(p, str) and p]
+    return (" — ".join(parts))[:300] if parts else None
+
+
 def _receipt_tx_hash(resp, raw_response: dict | None) -> str | None:
     """The tx hash: the `Payment-Receipt` reference, else a `tx_hash` in the
     JSON body (this project's own receivers put it there)."""
@@ -254,7 +266,7 @@ def pay(
     raw_response = _safe_json(resp)
 
     if resp.status_code >= 400:
-        error = (raw_response or {}).get("message", f"HTTP {resp.status_code}")
+        error = (raw_response or {}).get("message") or _problem_detail(resp) or f"HTTP {resp.status_code}"
         return PaymentResult(
             success=False, signature=signature, raw_request=body, raw_response=raw_response, error=error
         )
@@ -438,8 +450,10 @@ def pay_url(
 
     content = _content_of(resp)
     if resp.status_code >= 400:
+        reason = _problem_detail(resp)
         return PaymentResult(
-            success=False, raw_request=raw_request, raw_response=content, error=f"HTTP {resp.status_code}",
+            success=False, raw_request=raw_request, raw_response=content,
+            error=f"HTTP {resp.status_code}: {reason}" if reason else f"HTTP {resp.status_code}",
         )
     return PaymentResult(
         success=True, tx_hash=_receipt_tx_hash(resp, None), raw_request=raw_request, raw_response=content,

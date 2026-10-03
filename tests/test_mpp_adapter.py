@@ -596,3 +596,49 @@ def test_pay_url_cuts_very_long_content_and_says_so(monkeypatch):
 
     assert len(result.raw_response["body"]) == 20_000
     assert result.raw_response["truncated"] is True
+
+
+@respx.mock
+def test_pay_url_shows_the_reason_from_a_problem_details_error_body(monkeypatch):
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    install_fake_tempo(monkeypatch, wallet.address)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("authorization", "").startswith("Payment "):
+            return httpx.Response(
+                402, headers={"Content-Type": "application/problem+json"},
+                json={"type": "https://paymentauth.org/problems/verification-failed", "title": "Verification Failed",
+                      "status": 402, "detail": "the payment transaction was not found on chain"},
+            )
+        return httpx.Response(402, headers={"WWW-Authenticate": www_authenticate(url_challenge())}, json={})
+
+    respx.get(PAID_URL).mock(side_effect=handler)
+
+    result = mpp.pay_url(url=PAID_URL, wallet=wallet, expected=url_expected())
+
+    assert not result.success
+    assert result.error == "HTTP 402: Verification Failed — the payment transaction was not found on chain"
+
+
+@respx.mock
+def test_pay_url_keeps_a_bare_status_when_the_error_body_has_no_reason(monkeypatch):
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    install_fake_tempo(monkeypatch, wallet.address)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("authorization", "").startswith("Payment "):
+            return httpx.Response(500, json={"unrelated": "field"})
+        return httpx.Response(402, headers={"WWW-Authenticate": www_authenticate(url_challenge())}, json={})
+
+    respx.get(PAID_URL).mock(side_effect=handler)
+
+    assert mpp.pay_url(url=PAID_URL, wallet=wallet, expected=url_expected()).error == "HTTP 500"
+
+
+@respx.mock
+def test_pay_to_an_agent_falls_back_to_problem_details_when_there_is_no_message(monkeypatch):
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    install_fake_tempo(monkeypatch, wallet.address)
+    respx.post(URL).mock(return_value=httpx.Response(403, json={"title": "Forbidden", "detail": "agent is not active"}))
+
+    assert pay(wallet).error == "Forbidden — agent is not active"
