@@ -79,6 +79,44 @@ class Agent:
             wallet_address=self.wallet.address, recipient=recipient, token=token, amount=amount, rail=rail
         )
 
+    def _precheck_balance(
+        self,
+        *,
+        token_address: str,
+        label: str,
+        needed_units: int | None = None,
+        needed_amount: Decimal | None = None,
+        limits=None,
+    ) -> tuple[int | None, str | None]:
+        """`(chain_id, reason)` — `reason` is why the wallet can't cover the
+        payment, or None. Used by the relay-settled rails (AP2, pay button)
+        to find out *before* anything server-side is created (a mandate, a
+        payin) that the wallet is short; the settle step still re-checks
+        against the payin's own init response afterwards.
+
+        The chain and RPC come from this agent's own payout token with the
+        same contract address — authoritative for that token, unlike a
+        network slug like "tempo_testnet", which can't be mapped to a
+        chain reliably. A token that isn't one of the agent's payout
+        tokens, or has no RPC on record, is skipped (nothing to read), not
+        blocked."""
+        limits = limits or self._agents_client.get_agent(self._settings.moramba_agent_id)
+        match = next(
+            (t for t in limits.payout_tokens if t.token_address and t.token_address.lower() == token_address.lower()),
+            None,
+        )
+        if match is None:
+            return None, None
+        chain_id = match.chain or self._settings.chain_id
+        rpc_url = match.rpc_url or (self._settings.rpc_url if chain_id == self._settings.chain_id else None)
+        if not rpc_url:
+            return chain_id, None
+        reason = balance.insufficient_balance_reason(
+            rpc_url=rpc_url, token_address=token_address, wallet_address=self.wallet.address,
+            label=label, needed_units=needed_units, needed_amount=needed_amount,
+        )
+        return chain_id, reason
+
     def pay_via_mpp(
         self,
         *,
@@ -417,6 +455,22 @@ class Agent:
                 raw_request={"session_id": session.session_id}, raw_response=session.raw,
             )
 
+        # Before anything is authorized or created server-side: the
+        # session already says which token and how much, so an underfunded
+        # wallet can be stopped here, instead of after the mandate and the
+        # payin exist.
+        option = ap2.selected_payment_option(session.raw, session.currency)
+        if option and option.get("token_address") and option.get("amount") is not None:
+            chain_id, reason = self._precheck_balance(
+                token_address=option["token_address"], label=session.currency, needed_units=int(option["amount"]),
+            )
+            if reason:
+                return self.ledger.record(
+                    rail="ap2", recipient=recipient, token=session.currency, amount=amount,
+                    chain_id=chain_id, status=STATUS_FAILED, reason=reason,
+                    raw_request={"session_id": session.session_id}, raw_response=session.raw,
+                )
+
         result = ap2.settle_autonomous_checkout(
             base_url=self._settings.moramba_api_base_url, api_key=key, agent_id=self._settings.moramba_agent_id,
             wallet=self.wallet, session=session, buyer_email=buyer_email,
@@ -503,6 +557,19 @@ class Agent:
                 status=STATUS_REJECTED, reason=check.reason,
                 raw_request={"button_id": button_id, "network": plan.method.network},
             )
+
+        # Before the payin is created — an unfunded wallet shouldn't leave
+        # an orphan payin behind on Moramba's side.
+        if plan.method.token_address:
+            chain_id, reason = self._precheck_balance(
+                token_address=plan.method.token_address, label=token, needed_amount=plan.amount, limits=limits,
+            )
+            if reason:
+                return self.ledger.record(
+                    rail="pay_button", recipient=recipient, token=token, amount=plan.amount,
+                    chain_id=chain_id, status=STATUS_FAILED, reason=reason,
+                    raw_request={"button_id": button_id, "network": plan.method.network},
+                )
 
         result = pay_button_adapter.pay_button(self._settings.moramba_api_base_url, button_id, plan, self.wallet)
         record = self.ledger.record(

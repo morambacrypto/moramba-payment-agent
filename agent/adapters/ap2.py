@@ -136,6 +136,20 @@ def _public_api_request(base_url: str, path: str, method: str = "GET", body: dic
     return parsed["data"]
 
 
+def selected_payment_option(data: dict[str, Any], currency: str) -> dict[str, Any] | None:
+    """The session's chosen `payment_options[]` entry — matched by
+    `selected_payout_destination_id` when present (several options can
+    share a token name across networks), else by token name. Carries the
+    token's contract address, amount (smallest units) and decimals."""
+    options = data.get("payment_options") or []
+    selected_id = data.get("selected_payout_destination_id")
+    if selected_id is not None:
+        matching = next((o for o in options if o.get("payout_destination_id") == selected_id), None)
+        if matching is not None:
+            return matching
+    return next((o for o in options if str(o.get("token", "")).upper() == currency), None)
+
+
 def _resolve_session_decimals(data: dict[str, Any], currency: str) -> int:
     """`currency` is the settlement token's own name (`currency_for` in
     acp_checkout_service.rs, Moramba's side), not an ISO fiat code — a
@@ -150,13 +164,7 @@ def _resolve_session_decimals(data: dict[str, Any], currency: str) -> int:
     checkout (1,500,000 minor units at 6 decimals) into 15,000 — a
     10,000x inflation that then looked like a spend-limit violation for
     an otherwise completely ordinary coffee purchase."""
-    options = data.get("payment_options") or []
-    selected_id = data.get("selected_payout_destination_id")
-    if selected_id is not None:
-        matching = next((o for o in options if o.get("payout_destination_id") == selected_id), None)
-        if matching is not None:
-            return int(matching["decimals"])
-    matching = next((o for o in options if str(o.get("token", "")).upper() == currency), None)
+    matching = selected_payment_option(data, currency)
     if matching is not None:
         return int(matching["decimals"])
     # No payment_options at all (e.g. a non-Moramba-aware ACP backend) —
