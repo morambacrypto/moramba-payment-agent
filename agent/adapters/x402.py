@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from x402 import x402ClientSync
+from x402 import SchemeRegistration, x402ClientConfig, x402ClientSync
 from x402.http import x402HTTPClientSync
 from x402.mechanisms.evm.exact import ExactEvmScheme
 
@@ -116,8 +116,29 @@ def settle(
     if probe_result.requirement is None:
         return PaymentResult(success=False, error="no payable ('exact'-scheme) x402 requirement to settle")
 
-    client = x402ClientSync()
-    client.register(probe_result.requirement.network, ExactEvmScheme(signer=wallet._account))
+    requirement = probe_result.requirement
+    # The SDK's own default is a hard cap of $1 per payment, and only its
+    # list of well-known tokens is payable — whatever the agent's own limits
+    # say. That refused a $2 payment the agent had approved, and made any
+    # other token (pathUSD, say) impossible to pay at all, both with an
+    # opaque NoMatchingRequirementsError. The caller's limit check is what
+    # decides, so the SDK is told exactly what was approved: this token, on
+    # this network, up to this amount, and nothing else. It stays a second
+    # net — it can never pay more than the approved amount.
+    client = x402ClientSync.from_config(
+        x402ClientConfig(
+            schemes=[SchemeRegistration(network=requirement.network, client=ExactEvmScheme(signer=wallet._account))],
+            spend_controls={
+                "allowed_assets": [
+                    {
+                        "network": requirement.network,
+                        "asset": requirement.asset,
+                        "max_amount_per_payment": requirement.amount_atomic,
+                    }
+                ]
+            },
+        )
+    )
     http_client = x402HTTPClientSync(client)
 
     try:

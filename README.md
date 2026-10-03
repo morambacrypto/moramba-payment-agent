@@ -405,10 +405,18 @@ Two-phase by design (`probe()` then `settle()`), unlike MPP/ERC20:
 x402's amount, token, and recipient aren't known until the server's own
 402 challenge arrives, so the spend-limit check has to run **between**
 discovering the requirement and ever signing anything — never before
-(nothing to check yet) and never after (too late). The official SDK
-also applies its own `spend_controls` (default-assets allowlist, a
-per-payment cap) as a second, independent safety net before our check
-ever runs.
+(nothing to check yet) and never after (too late).
+
+The official SDK has its own `spend_controls`, and by default they are
+tight: a hard cap of **$1 per payment**, and only the SDK's list of
+well-known tokens can be paid. Left alone they overrode the agent's own
+limits — a $5 payment the agent had approved failed with an opaque
+`NoMatchingRequirementsError`, and a token the agent is configured for but
+the SDK doesn't know could never be paid. So once our limit check has
+approved a requirement, the SDK is told exactly that: this token, on this
+network, up to this amount (`spend_controls.allowed_assets`). Our check
+decides; the SDK stays a second net that can never sign for more than what
+was approved.
 
 ### MPP — on Tempo only, built on the official `pympp` SDK
 MPP here runs on **Tempo only** (mainnet 4217, testnet 42431). The rail
