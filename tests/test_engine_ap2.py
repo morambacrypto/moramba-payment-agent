@@ -4,6 +4,7 @@ from unittest.mock import patch
 import httpx
 import respx
 
+from agent import balance
 from agent.adapters import ap2
 from agent.config import Settings
 from agent.engine import Agent
@@ -345,3 +346,92 @@ def test_pay_via_ap2_still_records_a_plain_failure_as_failed(tmp_path):
 
     assert record.status == STATUS_FAILED
     assert spent == Decimal("0")
+
+
+AP2_TOKEN = {
+    "id": "t-1", "network": "Tempo", "chain": 42431, "network_type": "testnet",
+    "rpc_url": "https://rpc.moderato.tempo.xyz", "token_name": "PATHUSD",
+    "token_address": "0x" + "20" * 20,
+}
+
+
+def _session_with_option():
+    option_id = "11111111-1111-1111-1111-111111111111"
+    return ap2.CheckoutSession(
+        session_id="sess-1", amount="1500000", currency="PATHUSD", decimals=6,
+        raw={
+            "selected_payout_destination_id": option_id,
+            "payment_options": [
+                {
+                    "payout_destination_id": option_id, "network": "tempo_testnet", "token": "pathusd",
+                    "token_address": AP2_TOKEN["token_address"], "amount": 1_500_000, "decimals": 6,
+                }
+            ],
+        },
+    )
+
+
+@respx.mock
+def test_pay_via_ap2_fails_before_authorizing_anything_when_the_wallet_lacks_the_token(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[AP2_TOKEN])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    reason = "insufficient token balance: wallet 0xabc has 0 PATHUSD, needs 1.5 — fund it first"
+
+    agent = Agent(settings)
+    try:
+        with patch.object(ap2, "create_checkout_session", return_value=_session_with_option()), \
+             patch.object(balance, "insufficient_balance_reason", return_value=reason) as mock_check, \
+             patch.object(ap2, "settle_autonomous_checkout") as mock_settle:
+            record = agent.pay_via_ap2(items=[{"id": "coffee-1"}], buyer_email="buyer@example.com")
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_FAILED
+    assert record.reason == reason
+    assert record.chain_id == 42431
+    assert record.amount == Decimal("1.5")
+    mock_settle.assert_not_called()  # no mandate signed, no payin created
+    assert mock_check.call_args.kwargs["token_address"] == AP2_TOKEN["token_address"]
+    assert mock_check.call_args.kwargs["rpc_url"] == AP2_TOKEN["rpc_url"]
+    assert mock_check.call_args.kwargs["needed_units"] == 1_500_000
+
+
+@respx.mock
+def test_pay_via_ap2_skips_the_early_check_when_the_session_has_no_payment_option(tmp_path):
+    settings = make_settings(tmp_path)
+    wallet = load_wallet(TEST_PRIVATE_KEY)
+    mock_agent_lookup(wallet.address, allowed_tokens=[{"token_name": "USD"}])
+    respx.post(f"{MORAMBA_BASE}/api/v2/morambacrypto/public/agent/{AGENT_ID}/payments/sync").mock(
+        return_value=httpx.Response(404)
+    )
+    session = ap2.CheckoutSession(session_id="sess-1", amount="500", currency="USD", decimals=2, raw={})
+    ok = ap2.Ap2SettlementResult(success=True, tx_hash="0xok", flow="plain", payin_id="payin-1", chain_id=42431)
+
+    agent = Agent(settings)
+    try:
+        with patch.object(ap2, "create_checkout_session", return_value=session), \
+             patch.object(balance, "insufficient_balance_reason") as mock_check, \
+             patch.object(ap2, "settle_autonomous_checkout", return_value=ok):
+            record = agent.pay_via_ap2(items=[{"id": "button-1"}], buyer_email="buyer@example.com")
+    finally:
+        agent.close()
+
+    assert record.status == STATUS_SETTLED
+    mock_check.assert_not_called()
+
+
+def test_selected_payment_option_prefers_the_selected_destination_over_a_same_named_token():
+    data = {
+        "selected_payout_destination_id": "b",
+        "payment_options": [
+            {"payout_destination_id": "a", "token": "pathusd", "token_address": "0xA"},
+            {"payout_destination_id": "b", "token": "pathusd", "token_address": "0xB"},
+        ],
+    }
+    assert ap2.selected_payment_option(data, "PATHUSD")["token_address"] == "0xB"
+    assert ap2.selected_payment_option({"payment_options": data["payment_options"]}, "PATHUSD")["token_address"] == "0xA"
+    assert ap2.selected_payment_option({}, "PATHUSD") is None

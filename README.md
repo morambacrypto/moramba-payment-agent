@@ -5,7 +5,7 @@ x402, AP2 (Autonomous), Moramba Pay Button, Agent Transfer (pay any
 Moramba agent directly by id), and Payin (pay an existing payin_id
 directly) — plus the local ledger, the live limit check, a FastAPI
 service wrapper, the setup wizard, and the MCP tool server, all with a
-passing test suite (228 tests) — including a required `PAYMENT_AGENT_API_KEY`
+passing test suite (233 tests) — including a required `PAYMENT_AGENT_API_KEY`
 bearer-token check in front of the HTTP/MCP server itself (2026-10-02),
 closing a real gap where `TUNNEL=1`'s public URL had no auth of its own.
 Packaged as a proper
@@ -39,7 +39,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 228 tests, all passing
+python -m pytest -q          # 233 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -626,6 +626,20 @@ already spent getting it mined, so checking first is strictly cheaper,
 not just a nicer error message. This rail shares its on-chain sending
 code (`agent/adapters/erc20.py`) with `pay_agent`, so the same checks
 apply there too.
+
+**Every other rail checks the wallet's token balance too, before anything
+is signed** (`agent/balance.py`, plus `ap2.check_wallet_token_balance` for
+the relay-settled flows): MPP and x402 before signing, and AP2 and the pay
+button *before* anything is created on Moramba's side — the AP2 session
+and the button plan already name the token and amount, so an unfunded
+wallet is stopped before a mandate is authorized or a payin exists. Those
+two re-check against the payin's own init response afterwards. The chain
+and RPC for the early check come from the agent's own payout token with
+the same contract address (a network slug like `tempo_testnet` can't be
+mapped to a chain reliably); a token that isn't one of the agent's payout
+tokens, or has no RPC on record, is skipped rather than blocked. Fee
+funds are not pre-checked on Tempo (no native coin), so that case still
+surfaces as the clear `approve()` error.
 
 ### Network
 **Tempo testnet (chain id 42431) first.** Mainnet and other chains are a
