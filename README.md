@@ -5,7 +5,7 @@ x402, AP2 (Autonomous), Moramba Pay Button, Agent Transfer (pay any
 Moramba agent directly by id), and Payin (pay an existing payin_id
 directly) — plus the local ledger, the live limit check, a FastAPI
 service wrapper, the setup wizard, and the MCP tool server, all with a
-passing test suite (257 tests) — including a required `PAYMENT_AGENT_API_KEY`
+passing test suite (271 tests) — including a required `PAYMENT_AGENT_API_KEY`
 bearer-token check in front of the HTTP/MCP server itself (2026-10-02),
 closing a real gap where `TUNNEL=1`'s public URL had no auth of its own.
 Packaged as a proper
@@ -39,7 +39,7 @@ key to Moramba or to the LLM itself.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 moramba-payment-agent-setup   # interactive — writes .env for you; skip and copy .env.example by hand if you prefer
-python -m pytest -q          # 257 tests, all passing
+python -m pytest -q          # 271 tests, all passing
 ```
 
 (`pip install -e ".[dev]"` installs this package itself in editable mode
@@ -208,6 +208,17 @@ middleware) — without it, anyone who obtained the service's URL,
 especially the public one `TUNNEL=1` prints, could call any `pay_*`
 route directly, bounded only by the agent's own spend limits, not
 blocked outright.
+
+The key can be sent as `Authorization: Bearer <key>` or as
+`X-API-Key: <key>` — some clients' "add a header" boxes (Claude's web app
+among them) suggest an API-key style header, and it is equally secret
+either way. A bare key in `Authorization` (no `Bearer `) is refused. Every
+refusal gets a plain `401` back, and the service's own log says *why*,
+without ever printing a key: `no Authorization or X-API-Key header was
+sent`, `Authorization carries the key without the 'Bearer ' prefix`, `the
+Bearer key is 5 characters, expected 43 — partly copied or a different
+key`, and so on. If a client keeps getting `401`, look at the line the
+service printed.
 
 Managing the key after setup:
 
