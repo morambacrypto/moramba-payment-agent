@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     db_path: str = "moramba_payment_agent.db"
 
     # Shared secret required on every request to this process's HTTP/MCP
-    # server (`Authorization: Bearer <payment_agent_api_key>`) — generated
+    # server (`X-API-Key: <payment_agent_api_key>`) — generated
     # once by the setup wizard (32 random bytes, url-safe encoded).
     # Prefixed PAYMENT_AGENT_, not AGENT_: this is THIS running service's
     # own transport key, unrelated to a Moramba `agents` row's id or to
